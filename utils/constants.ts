@@ -1,0 +1,32 @@
+const RADIUS_NODE = 55
+const WIDTH_NODE_TITLE_BAR = 80
+const MIN_WIDTH_NODE_TITLE_BAR = 80
+const HEIGHT_NODE_TITLE_BAR = 30
+const PANEL_IMAGE_WIDTH = "max(10vw, 10%)"
+const PANEL_IMAGE_HEIGHT = "100vh"
+const NODE_IMAGE_SIZE = 81;
+const minScale = 0.5;
+const maxScale = 2.0;
+const SVG_WIDTH = 800;
+const SVG_HEIGHT = 600;
+// default avatar image blob, to use for avatars when user doesn't have any image
+// const defaultAvatar = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAiIGhlaWdodD0iMTAwIiB2aWV3Qm94PSIwIDAgMTAwIDEwMCI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIGZpbGw9IiM3ZjdjODAiLz48Y2lyY2xlIGN4PSI1MCIgY3k9IjQ1IiByPSIyNSIgZmlsbD0iI2ZmZiIvPjxjaXJjbGUgY3g9IjUwIiBjeT0iNzAiIHI9IjEyIiBmaWxsPSIjZmZmIiBzdHJva2U9IiM3ZDhmOTAiIHN0cm9rZS13aWR0aD0iNCIvPjwvc3ZnPg==";
+const defaultAvatar = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIGZpbGw9IiM3ZjdjODAiLz48Y2lyY2xlIGN4PSI1MCIgY3k9IjMwIiByPSIxNSIgZmlsbD0iI2ZmZiIvPjxjaXJjbGUgY3g9IjUwIiBjeT0iNzUiIHI9IjI1IiBmaWxsPSIjZmZmIiBzdHJva2U9IiM3ZDhmOTAiIHN0cm9rZS13aWR0aD0iNCIvPjwvc3ZnPg==";
+const expandIcon = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIGZpbGw9IiNmZmYiLz48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSIxMCIgZmlsbD0iIzAwMCIvPjxwb2x5bGluZSBwb2ludHM9IjUwLDIwIDUwLDAgNTAsMjAiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIzIi8+PHBvbHlsaW5lIHBvaW50cz0iNzAsNTEgOTAsNTEgNzAsNzEiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIzIi8+PHBvbHlsaW5lIHBvaW50cz0iMzAsNTEgMTAsNTEgMzAsNzEiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIzIi8+PC9zdmc+";
+const collapseIcon = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIGZpbGw9IiNmZmYiLz48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSIxMCIgZmlsbD0iIzAwMCIvPjxwb2x5bGluZSBwb2ludHM9IjUwLDAgNTAwIDIwIDUwLDAiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHR="
+
+
+export {
+    RADIUS_NODE,
+    WIDTH_NODE_TITLE_BAR,
+    MIN_WIDTH_NODE_TITLE_BAR,
+    HEIGHT_NODE_TITLE_BAR,
+    PANEL_IMAGE_WIDTH,
+    PANEL_IMAGE_HEIGHT,
+    NODE_IMAGE_SIZE,
+    minScale,
+    maxScale,
+    SVG_WIDTH,
+    SVG_HEIGHT,
+    defaultAvatar
+}
