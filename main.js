@@ -14500,18 +14500,6 @@ var AppContainer = class {
     if (!this.mapModeCanvasEl || this.mapModeCanvasEl.dataset.ikgGestureShield === "true") {
       return;
     }
-    const stopBubble = (event) => {
-      event.stopPropagation();
-    };
-    this.mapModeCanvasEl.addEventListener("touchstart", stopBubble, { passive: false });
-    this.mapModeCanvasEl.addEventListener("touchmove", stopBubble, { passive: false });
-    this.mapModeCanvasEl.addEventListener("touchend", stopBubble, { passive: false });
-    this.mapModeCanvasEl.addEventListener("touchcancel", stopBubble, { passive: false });
-    this.mapModeCanvasEl.addEventListener("pointerdown", stopBubble, { passive: true });
-    this.mapModeCanvasEl.addEventListener("pointermove", stopBubble, { passive: true });
-    this.mapModeCanvasEl.addEventListener("pointerup", stopBubble, { passive: true });
-    this.mapModeCanvasEl.addEventListener("pointercancel", stopBubble, { passive: true });
-    this.mapModeCanvasEl.addEventListener("wheel", stopBubble, { passive: true });
     L2.DomEvent.disableClickPropagation(this.mapModeCanvasEl);
     L2.DomEvent.disableScrollPropagation(this.mapModeCanvasEl);
     this.mapModeCanvasEl.dataset.ikgGestureShield = "true";
@@ -15101,42 +15089,12 @@ var AppContainer = class {
     this.mapAddressSearchLoading = true;
     this.refreshMapModeFromState();
     try {
-      const searchUrl = new URL("https://nominatim.openstreetmap.org/search");
-      searchUrl.searchParams.set("q", query);
-      searchUrl.searchParams.set("format", "jsonv2");
-      searchUrl.searchParams.set("limit", "6");
-      searchUrl.searchParams.set("addressdetails", "1");
-      const response = await fetch(searchUrl.toString(), {
-        method: "GET",
-        headers: {
-          "Accept": "application/json"
-        },
-        signal: abortController.signal
-      });
-      if (!response.ok) {
-        throw new Error(`Address search failed with HTTP ${response.status}`);
+      const primaryResults = await this.fetchNominatimAddressResults(query, abortController.signal);
+      if (primaryResults.length > 0) {
+        this.mapAddressSearchResults = primaryResults;
+      } else {
+        this.mapAddressSearchResults = await this.fetchPostalCodeFallbackResults(query, abortController.signal);
       }
-      const payload = await response.json();
-      const results = Array.isArray(payload) ? payload : [];
-      this.mapAddressSearchResults = results.map((entry, index2) => {
-        var _a2, _b, _c, _d, _e, _f;
-        const lat = Number.parseFloat(String((_a2 = entry == null ? void 0 : entry.lat) != null ? _a2 : ""));
-        const lng = Number.parseFloat(String((_b = entry == null ? void 0 : entry.lon) != null ? _b : ""));
-        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-          return null;
-        }
-        const displayName = String((_c = entry == null ? void 0 : entry.display_name) != null ? _c : query);
-        const name = String((_d = entry == null ? void 0 : entry.name) != null ? _d : "").trim();
-        const title = name || ((_e = displayName.split(",")[0]) == null ? void 0 : _e.trim()) || query;
-        const subtitle = displayName === title ? `${lat.toFixed(5)}, ${lng.toFixed(5)}` : displayName;
-        return {
-          id: String((_f = entry == null ? void 0 : entry.place_id) != null ? _f : `${query}-${index2}`),
-          title,
-          subtitle,
-          lat,
-          lng
-        };
-      }).filter((result) => result !== null);
     } catch (error) {
       if ((error == null ? void 0 : error.name) !== "AbortError") {
         console.error("Address search failed", error);
@@ -15149,6 +15107,90 @@ var AppContainer = class {
       }
       this.refreshMapModeFromState();
     }
+  }
+  async fetchNominatimAddressResults(query, signal) {
+    const searchUrl = new URL("https://nominatim.openstreetmap.org/search");
+    searchUrl.searchParams.set("q", query);
+    searchUrl.searchParams.set("format", "jsonv2");
+    searchUrl.searchParams.set("limit", "6");
+    searchUrl.searchParams.set("addressdetails", "1");
+    const response = await fetch(searchUrl.toString(), {
+      method: "GET",
+      headers: {
+        "Accept": "application/json"
+      },
+      signal
+    });
+    if (!response.ok) {
+      throw new Error(`Address search failed with HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const results = Array.isArray(payload) ? payload : [];
+    return results.map((entry, index2) => this.buildMapAddressSearchResultFromGeocoder(entry, query, index2)).filter((result) => result !== null);
+  }
+  async fetchPostalCodeFallbackResults(query, signal) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const normalized = query.trim().toUpperCase().replace(/\s+/g, "");
+    const fallbackTargets = [];
+    if (/^\d{5}(?:-\d{4})?$/.test(normalized)) {
+      fallbackTargets.push({ country: "us", postalCode: normalized.slice(0, 5) });
+    }
+    if (/^[A-Z]\d[A-Z]\d[A-Z]\d$/.test(normalized)) {
+      fallbackTargets.push({ country: "ca", postalCode: normalized });
+    }
+    const fallbackResults = [];
+    for (const target of fallbackTargets) {
+      const response = await fetch(`https://api.zippopotam.us/${target.country}/${target.postalCode}`, {
+        method: "GET",
+        headers: {
+          "Accept": "application/json"
+        },
+        signal
+      });
+      if (!response.ok) {
+        continue;
+      }
+      const payload = await response.json();
+      const places = Array.isArray(payload == null ? void 0 : payload.places) ? payload.places : [];
+      for (const [index2, place] of places.entries()) {
+        const lat = Number.parseFloat(String((_a = place == null ? void 0 : place.latitude) != null ? _a : ""));
+        const lng = Number.parseFloat(String((_b = place == null ? void 0 : place.longitude) != null ? _b : ""));
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+          continue;
+        }
+        const placeName = String((_d = (_c = place == null ? void 0 : place["place name"]) != null ? _c : payload == null ? void 0 : payload["post code"]) != null ? _d : query);
+        const state = String((_f = (_e = place == null ? void 0 : place.state) != null ? _e : place == null ? void 0 : place["state abbreviation"]) != null ? _f : "").trim();
+        const country = String((_g = payload == null ? void 0 : payload.country) != null ? _g : target.country.toUpperCase()).trim();
+        const subtitleParts = [payload == null ? void 0 : payload["post code"], state, country].filter((value) => typeof value === "string" && value.trim().length > 0);
+        fallbackResults.push({
+          id: `${target.country}-${target.postalCode}-${index2}`,
+          title: placeName,
+          subtitle: subtitleParts.join(" \u2022 "),
+          lat,
+          lng
+        });
+      }
+    }
+    return fallbackResults;
+  }
+  buildMapAddressSearchResultFromGeocoder(entry, query, index2) {
+    var _a, _b, _c, _d, _e, _f;
+    const lat = Number.parseFloat(String((_a = entry == null ? void 0 : entry.lat) != null ? _a : ""));
+    const lng = Number.parseFloat(String((_b = entry == null ? void 0 : entry.lon) != null ? _b : ""));
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return null;
+    }
+    const displayName = String((_c = entry == null ? void 0 : entry.display_name) != null ? _c : query);
+    const name = String((_d = entry == null ? void 0 : entry.name) != null ? _d : "").trim();
+    const title = name || ((_e = displayName.split(",")[0]) == null ? void 0 : _e.trim()) || query;
+    const subtitle = displayName === title ? `${lat.toFixed(5)}, ${lng.toFixed(5)}` : displayName;
+    return {
+      id: String((_f = entry == null ? void 0 : entry.place_id) != null ? _f : `${query}-${index2}`),
+      title,
+      subtitle,
+      lat,
+      lng
+    };
   }
   chooseMapAddressSearchResult(result) {
     var _a, _b, _c;
