@@ -24,7 +24,7 @@ npm run build
 
 ## BRAT install
 
-This plugin is set up to be installable through BRAT from the GitHub repo:
+This plugin is set up to be installable through BRAT from GitHub releases in:
 
 `ikendoit/ikendoit-graph-stuff`
 
@@ -33,7 +33,26 @@ Recommended device workflow:
 1. Install BRAT on each device.
 2. In BRAT, add the beta plugin by GitHub repo:
    `ikendoit/ikendoit-graph-stuff`
-3. Use BRAT to check for updates after new commits land.
+3. Use BRAT to check for updates after a new GitHub release lands.
+
+## Release workflow
+
+For BRAT updates, the important unit is a GitHub release whose tag matches the plugin version.
+
+Recommended flow:
+
+1. Make code changes in the repo.
+2. Bump the plugin version in `package.json`.
+3. Run `npm run build`.
+4. Commit and push.
+5. Push a matching Git tag such as `1.0.4`.
+
+The GitHub Actions release workflow then publishes release assets with:
+
+- `manifest.json`
+- `main.js`
+- `styles.css`
+- `versions.json`
 
 ## Local vault sync helper
 
