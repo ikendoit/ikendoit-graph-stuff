@@ -51,6 +51,14 @@ interface NodeLocationRecord {
 	lng: number;
 }
 
+interface MapAddressSearchResult {
+	id: string;
+	title: string;
+	subtitle: string;
+	lat: number;
+	lng: number;
+}
+
 interface SyncedReleaseManifest {
 	pluginId: string;
 	version: string;
@@ -576,6 +584,9 @@ class AppContainer {
 	mapNodeCountEl: HTMLElement | null = null;
 	mapSelectionTitleEl: HTMLElement | null = null;
 	mapSelectionMetaEl: HTMLElement | null = null;
+	mapSearchInputEl: HTMLInputElement | null = null;
+	mapSearchStatusEl: HTMLElement | null = null;
+	mapSearchResultsEl: HTMLElement | null = null;
 	mapDraftLabelInputEl: HTMLInputElement | null = null;
 	mapDraftValueInputEl: HTMLInputElement | null = null;
 	mapLocatedListEl: HTMLElement | null = null;
@@ -587,6 +598,10 @@ class AppContainer {
 	mapLayerControl: L.Control.Layers | null = null;
 	mapShouldAutoFrame = true;
 	mapAutoFrameNodeId: string | null = null;
+	mapAddressSearchQuery = '';
+	mapAddressSearchResults: MapAddressSearchResult[] = [];
+	mapAddressSearchLoading = false;
+	mapAddressSearchAbortController: AbortController | null = null;
 	layoutObserver: ResizeObserver | null = null;
 	layoutSyncFrameHandle: number | null = null;
 
@@ -639,6 +654,8 @@ class AppContainer {
 	}
 
 	private destroyMapMode() {
+		this.mapAddressSearchAbortController?.abort();
+		this.mapAddressSearchAbortController = null;
 		this.mapInstance?.remove();
 		this.mapInstance = null;
 		this.mapMarkerLayer = null;
@@ -651,6 +668,9 @@ class AppContainer {
 		this.mapNodeCountEl = null;
 		this.mapSelectionTitleEl = null;
 		this.mapSelectionMetaEl = null;
+		this.mapSearchInputEl = null;
+		this.mapSearchStatusEl = null;
+		this.mapSearchResultsEl = null;
 		this.mapDraftLabelInputEl = null;
 		this.mapDraftValueInputEl = null;
 		this.mapLocatedListEl = null;
@@ -1377,6 +1397,93 @@ class AppContainer {
 		});
 	}
 
+	private async searchMapAddresses(rawQuery: string) {
+		const query = rawQuery.trim();
+		this.mapAddressSearchQuery = rawQuery;
+		if (!query) {
+			this.mapAddressSearchResults = [];
+			this.mapAddressSearchLoading = false;
+			this.refreshMapModeFromState();
+			return;
+		}
+
+		this.mapAddressSearchAbortController?.abort();
+		const abortController = new AbortController();
+		this.mapAddressSearchAbortController = abortController;
+		this.mapAddressSearchLoading = true;
+		this.refreshMapModeFromState();
+
+		try {
+			const searchUrl = new URL('https://nominatim.openstreetmap.org/search');
+			searchUrl.searchParams.set('q', query);
+			searchUrl.searchParams.set('format', 'jsonv2');
+			searchUrl.searchParams.set('limit', '6');
+			searchUrl.searchParams.set('addressdetails', '1');
+
+			const response = await fetch(searchUrl.toString(), {
+				method: 'GET',
+				headers: {
+					'Accept': 'application/json',
+				},
+				signal: abortController.signal,
+			});
+
+			if (!response.ok) {
+				throw new Error(`Address search failed with HTTP ${response.status}`);
+			}
+
+			const payload = await response.json();
+			const results = Array.isArray(payload) ? payload : [];
+			this.mapAddressSearchResults = results
+				.map((entry: any, index: number): MapAddressSearchResult | null => {
+					const lat = Number.parseFloat(String(entry?.lat ?? ''));
+					const lng = Number.parseFloat(String(entry?.lon ?? ''));
+					if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+						return null;
+					}
+					const displayName = String(entry?.display_name ?? query);
+					const name = String(entry?.name ?? '').trim();
+					const title = name || displayName.split(',')[0]?.trim() || query;
+					const subtitle = displayName === title ? `${lat.toFixed(5)}, ${lng.toFixed(5)}` : displayName;
+					return {
+						id: String(entry?.place_id ?? `${query}-${index}`),
+						title,
+						subtitle,
+						lat,
+						lng,
+					};
+				})
+				.filter((result: MapAddressSearchResult | null): result is MapAddressSearchResult => result !== null);
+		} catch (error: any) {
+			if (error?.name !== 'AbortError') {
+				console.error('Address search failed', error);
+				new Notice('Address search failed. Try another query in a moment.');
+			}
+		} finally {
+			if (this.mapAddressSearchAbortController === abortController) {
+				this.mapAddressSearchAbortController = null;
+				this.mapAddressSearchLoading = false;
+			}
+			this.refreshMapModeFromState();
+		}
+	}
+
+	private chooseMapAddressSearchResult(result: MapAddressSearchResult) {
+		this.mapDraftLatLng = { lat: result.lat, lng: result.lng };
+		if (this.mapDraftValueInputEl) {
+			this.mapDraftValueInputEl.value = `${result.lat.toFixed(6)},${result.lng.toFixed(6)}`;
+		}
+		if (this.mapDraftLabelInputEl && !this.mapDraftLabelInputEl.value.trim()) {
+			this.mapDraftLabelInputEl.value = result.title;
+		}
+		this.mapShouldAutoFrame = false;
+		this.mapAutoFrameNodeId = null;
+		this.mapInstance?.setView([result.lat, result.lng], Math.max(this.mapInstance?.getZoom() ?? MAP_MODE_DEFAULT_ZOOM, 16), {
+			animate: false,
+		});
+		this.refreshMapModeFromState();
+	}
+
 	private createMapModeShell() {
 		if (this.mapModeRootEl?.isConnected && this.mapModeCanvasEl && this.mapModeSidebarEl) {
 			return;
@@ -1387,6 +1494,41 @@ class AppContainer {
 		const root = contentEl.createDiv({ cls: 'ikg-map-mode' });
 		const canvas = root.createDiv({ cls: 'ikg-map-mode__canvas' });
 		const sidebar = root.createDiv({ cls: 'ikg-map-mode__sidebar' });
+
+		const searchCard = sidebar.createDiv({ cls: 'ikg-map-mode__card' });
+		searchCard.createDiv({ cls: 'ikg-map-mode__card-eyebrow', text: 'Address search' });
+		searchCard.createDiv({ cls: 'ikg-map-mode__card-copy', text: 'Search an address, jump there, then save the red draft pin onto the selected node.' });
+		const searchForm = searchCard.createDiv({ cls: 'ikg-map-mode__compose' });
+		const addressSearchInput = searchForm.createEl('input', {
+			type: 'search',
+			placeholder: 'Search address or place…',
+			cls: 'ikg-map-mode__input',
+		});
+		addressSearchInput.value = this.mapAddressSearchQuery;
+		const searchActions = searchForm.createDiv({ cls: 'ikg-map-mode__actions' });
+		const addressSearchButton = searchActions.createEl('button', { text: 'Find address' });
+		const clearAddressSearchButton = searchActions.createEl('button', { text: 'Clear results' });
+		const searchStatus = searchCard.createDiv({ cls: 'ikg-map-mode__card-copy', text: 'Existing node pins stay visible while you jump around the map.' });
+		const addressResults = searchCard.createDiv({ cls: 'ikg-map-mode__list' });
+		const submitAddressSearch = () => {
+			this.mapAddressSearchQuery = addressSearchInput.value;
+			void this.searchMapAddresses(addressSearchInput.value);
+		};
+		addressSearchInput.addEventListener('keydown', (event: KeyboardEvent) => {
+			if (event.key === 'Enter') {
+				event.preventDefault();
+				submitAddressSearch();
+			}
+		});
+		addressSearchButton.addEventListener('click', () => {
+			submitAddressSearch();
+		});
+		clearAddressSearchButton.addEventListener('click', () => {
+			this.mapAddressSearchQuery = '';
+			this.mapAddressSearchResults = [];
+			addressSearchInput.value = '';
+			this.refreshMapModeFromState();
+		});
 
 		const selectedCard = sidebar.createDiv({ cls: 'ikg-map-mode__card' });
 		selectedCard.createDiv({ cls: 'ikg-map-mode__card-eyebrow', text: 'Selected node' });
@@ -1456,6 +1598,9 @@ class AppContainer {
 		this.mapNodeCountEl = nodeCount;
 		this.mapSelectionTitleEl = selectedTitle;
 		this.mapSelectionMetaEl = selectedMeta;
+		this.mapSearchInputEl = addressSearchInput;
+		this.mapSearchStatusEl = searchStatus;
+		this.mapSearchResultsEl = addressResults;
 		this.mapDraftLabelInputEl = labelInput;
 		this.mapDraftValueInputEl = valueInput;
 		this.mapLocatedListEl = locatedList;
@@ -1475,7 +1620,7 @@ class AppContainer {
 
 	private async renderMapMode() {
 		this.createMapModeShell();
-		if (!this.mapModeCanvasEl || !this.mapLocatedListEl || !this.mapUnlocatedListEl || !this.mapSelectionTitleEl || !this.mapSelectionMetaEl || !this.mapNodeCountEl) {
+		if (!this.mapModeCanvasEl || !this.mapLocatedListEl || !this.mapUnlocatedListEl || !this.mapSelectionTitleEl || !this.mapSelectionMetaEl || !this.mapNodeCountEl || !this.mapSearchStatusEl || !this.mapSearchResultsEl) {
 			return;
 		}
 
@@ -1554,12 +1699,37 @@ class AppContainer {
 				: 'Choose a node from the graph, a marker, or the table to start saving locations.'
 		);
 		this.mapNodeCountEl.setText(`${locatedRecords.length} saved map pin${locatedRecords.length === 1 ? '' : 's'} across ${new Set(locatedRecords.map((record) => record.node.source)).size} nodes`);
+		this.mapSearchStatusEl.setText(
+			this.mapAddressSearchLoading
+				? 'Searching addresses…'
+				: this.mapAddressSearchResults.length > 0
+					? `${this.mapAddressSearchResults.length} address result${this.mapAddressSearchResults.length === 1 ? '' : 's'} ready. Tap one to move the red draft pin there.`
+					: this.mapAddressSearchQuery.trim().length > 0
+						? 'No address matches yet. Try a broader place name or a fuller street address.'
+						: 'Existing node pins stay visible while you jump around the map.'
+		);
 
 		if (this.mapDraftValueInputEl && !this.mapDraftValueInputEl.matches(':focus') && this.mapDraftLatLng) {
 			this.mapDraftValueInputEl.value = `${this.mapDraftLatLng.lat.toFixed(6)},${this.mapDraftLatLng.lng.toFixed(6)}`;
 		}
 		if (selectedNode && this.mapDraftLabelInputEl && !this.mapDraftLabelInputEl.value) {
 			this.mapDraftLabelInputEl.placeholder = `Pin label for ${selectedNode.source}`;
+		}
+
+		this.mapSearchResultsEl.empty();
+		if (this.mapAddressSearchLoading) {
+			this.mapSearchResultsEl.createDiv({ cls: 'ikg-map-mode__empty', text: 'Looking up matching addresses…' });
+		} else if (this.mapAddressSearchResults.length === 0) {
+			this.mapSearchResultsEl.createDiv({ cls: 'ikg-map-mode__empty', text: 'Search for a place, address, or landmark to drop the draft pin there quickly.' });
+		} else {
+			for (const result of this.mapAddressSearchResults) {
+				const item = this.mapSearchResultsEl.createDiv({ cls: 'ikg-map-mode__list-item' });
+				item.createDiv({ cls: 'ikg-map-mode__list-title', text: result.title });
+				item.createDiv({ cls: 'ikg-map-mode__list-copy', text: result.subtitle });
+				item.addEventListener('click', () => {
+					this.chooseMapAddressSearchResult(result);
+				});
+			}
 		}
 
 		this.mapLocatedListEl.empty();
