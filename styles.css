@@ -1,4 +1,5 @@
 .ikg-graph-host {
+	--ikg-control-bar-offset: 144px;
 	position: relative;
 	overflow: hidden;
 	background:
@@ -445,7 +446,7 @@
 
 .ikg-map-mode {
 	position: absolute;
-	inset: 144px 14px 14px;
+	inset: var(--ikg-control-bar-offset) 14px calc(14px + env(safe-area-inset-bottom, 0px)) 14px;
 	z-index: 12;
 	display: grid;
 	grid-template-columns: minmax(0, 1.5fr) minmax(320px, 420px);
@@ -464,6 +465,10 @@
 
 .ikg-map-mode__canvas {
 	min-height: 520px;
+	touch-action: none;
+	overscroll-behavior: contain;
+	-webkit-user-select: none;
+	user-select: none;
 }
 
 .ikg-map-mode__sidebar {
@@ -773,7 +778,7 @@
 
 @media (max-width: 900px) {
 	.ikg-map-mode {
-		inset: 188px 12px 12px;
+		inset: var(--ikg-control-bar-offset) 12px calc(12px + env(safe-area-inset-bottom, 0px)) 12px;
 		grid-template-columns: 1fr;
 		grid-template-rows: minmax(280px, 44vh) minmax(0, auto);
 	}

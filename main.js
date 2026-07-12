@@ -1904,7 +1904,7 @@ var require_leaflet_src = __commonJS({
         }
         return related !== el;
       }
-      var DomEvent = {
+      var DomEvent2 = {
         __proto__: null,
         on,
         off,
@@ -9506,7 +9506,7 @@ var require_leaflet_src = __commonJS({
       exports2.Control = Control;
       exports2.DivIcon = DivIcon;
       exports2.DivOverlay = DivOverlay;
-      exports2.DomEvent = DomEvent;
+      exports2.DomEvent = DomEvent2;
       exports2.DomUtil = DomUtil;
       exports2.Draggable = Draggable;
       exports2.Evented = Evented;
@@ -14382,6 +14382,8 @@ var AppContainer = class {
     this.mapLayerControl = null;
     this.mapShouldAutoFrame = true;
     this.mapAutoFrameNodeId = null;
+    this.layoutObserver = null;
+    this.layoutSyncFrameHandle = null;
     this.LABEL_RENDER_THRESHOLD = 120;
     this.IMAGE_RENDER_THRESHOLD = 90;
     this.DECORATION_RENDER_THRESHOLD = 50;
@@ -14435,6 +14437,78 @@ var AppContainer = class {
     this.mapDraftValueInputEl = null;
     this.mapLocatedListEl = null;
     this.mapUnlocatedListEl = null;
+  }
+  disconnectLayoutObserver() {
+    var _a;
+    (_a = this.layoutObserver) == null ? void 0 : _a.disconnect();
+    this.layoutObserver = null;
+  }
+  ensureLayoutObserver() {
+    var _a;
+    if (typeof ResizeObserver === "undefined" || !((_a = this.controlBarEl) == null ? void 0 : _a.isConnected)) {
+      return;
+    }
+    const contentEl = this.graphContainerPanel.view.containerEl;
+    this.disconnectLayoutObserver();
+    this.layoutObserver = new ResizeObserver(() => {
+      this.scheduleOverlayLayoutSync();
+    });
+    this.layoutObserver.observe(contentEl);
+    this.layoutObserver.observe(this.controlBarEl);
+  }
+  scheduleOverlayLayoutSync() {
+    if (this.layoutSyncFrameHandle != null) {
+      window.cancelAnimationFrame(this.layoutSyncFrameHandle);
+    }
+    this.layoutSyncFrameHandle = window.requestAnimationFrame(() => {
+      this.layoutSyncFrameHandle = null;
+      this.syncOverlayLayoutMetrics();
+    });
+  }
+  syncOverlayLayoutMetrics() {
+    var _a;
+    const contentEl = this.graphContainerPanel.view.containerEl;
+    const contentRect = contentEl.getBoundingClientRect();
+    const defaultTopOffset = window.innerWidth <= 900 ? 188 : 144;
+    const defaultEdgeInset = window.innerWidth <= 900 ? 12 : 14;
+    let topOffset = defaultTopOffset;
+    if ((_a = this.controlBarEl) == null ? void 0 : _a.isConnected) {
+      const controlBarRect = this.controlBarEl.getBoundingClientRect();
+      topOffset = Math.max(topOffset, Math.ceil(controlBarRect.bottom - contentRect.top + defaultEdgeInset));
+    }
+    contentEl.style.setProperty("--ikg-control-bar-offset", `${topOffset}px`);
+    if (this.currentMode === "map" && this.mapInstance) {
+      window.requestAnimationFrame(() => {
+        var _a2;
+        (_a2 = this.mapInstance) == null ? void 0 : _a2.invalidateSize(false);
+      });
+    }
+  }
+  installMapGestureShield() {
+    if (!this.mapModeCanvasEl || this.mapModeCanvasEl.dataset.ikgGestureShield === "true") {
+      return;
+    }
+    const stopBubble = (event) => {
+      event.stopPropagation();
+    };
+    const stopBubbleAndDefault = (event) => {
+      event.stopPropagation();
+      if (event.cancelable) {
+        event.preventDefault();
+      }
+    };
+    this.mapModeCanvasEl.addEventListener("touchstart", stopBubble, { passive: false });
+    this.mapModeCanvasEl.addEventListener("touchmove", stopBubbleAndDefault, { passive: false });
+    this.mapModeCanvasEl.addEventListener("touchend", stopBubble, { passive: false });
+    this.mapModeCanvasEl.addEventListener("touchcancel", stopBubble, { passive: false });
+    this.mapModeCanvasEl.addEventListener("pointerdown", stopBubble, { passive: true });
+    this.mapModeCanvasEl.addEventListener("pointermove", stopBubble, { passive: true });
+    this.mapModeCanvasEl.addEventListener("pointerup", stopBubble, { passive: true });
+    this.mapModeCanvasEl.addEventListener("pointercancel", stopBubble, { passive: true });
+    this.mapModeCanvasEl.addEventListener("wheel", stopBubble, { passive: true });
+    L2.DomEvent.disableClickPropagation(this.mapModeCanvasEl);
+    L2.DomEvent.disableScrollPropagation(this.mapModeCanvasEl);
+    this.mapModeCanvasEl.dataset.ikgGestureShield = "true";
   }
   queueMapAutoFrame(nodeId) {
     var _a;
@@ -14551,9 +14625,11 @@ var AppContainer = class {
     this.diagnosticsToggleButtonEl = diagnosticsButton;
     this.graphModeButtonEl = graphModeButton;
     this.mapModeButtonEl = mapModeButton;
+    this.ensureLayoutObserver();
     this.refreshControlBarMeta();
     this.refreshModeButtons();
     this.refreshDiagnosticsVisibility();
+    this.scheduleOverlayLayoutSync();
     return bar;
   }
   focusSearchInput() {
@@ -14605,13 +14681,16 @@ var AppContainer = class {
     if (!searchTerm) {
       if (this.currentMode === "map") {
         this.controlBarMetaEl.setText("Map mode shows all pinned nodes globally. Search filters the node lists, click the map to draft a position, then save it to the selected node.");
+        this.scheduleOverlayLayoutSync();
         return;
       }
       this.controlBarMetaEl.setText("Search titles, tags, file paths, or note text. The current note opens centered with bubbles ready \u2728 Hold any node for tools, or tap the same node again within 3.6s to expand.");
+      this.scheduleOverlayLayoutSync();
       return;
     }
     const suffix = hitCount > 0 ? this.currentMode === "map" ? "Matching nodes stay easy to scan in the map tables." : "Press Enter or Focus hit to jump to the first match." : "No matching nodes yet.";
     this.controlBarMetaEl.setText(`${hitCount} search hit${hitCount === 1 ? "" : "s"} for \u201C${searchTerm}\u201D. ${suffix}`);
+    this.scheduleOverlayLayoutSync();
   }
   async focusPrimarySearchResult() {
     const nodeId = this.graphState.getPrimarySearchResultId();
@@ -14652,6 +14731,7 @@ var AppContainer = class {
     this.diagnosticsPanelEl = null;
     this.diagnosticsToggleButtonEl = null;
     this.diagnosticsVisible = this.shouldDefaultDiagnosticsBeVisible();
+    this.disconnectLayoutObserver();
     this.controlBarEl = null;
     this.controlBarMetaEl = null;
     this.searchInputEl = null;
@@ -15078,6 +15158,8 @@ var AppContainer = class {
     this.mapDraftValueInputEl = valueInput;
     this.mapLocatedListEl = locatedList;
     this.mapUnlocatedListEl = unlocatedList;
+    this.installMapGestureShield();
+    this.scheduleOverlayLayoutSync();
   }
   refreshMapModeFromState() {
     if (this.currentMode !== "map") {
@@ -15146,6 +15228,7 @@ var AppContainer = class {
         this.refreshMapModeFromState();
       });
     }
+    this.scheduleOverlayLayoutSync();
     const locatedRecords = this.getAllLocatedRecords().filter((record) => this.nodeMatchesCurrentSearch(record.node));
     const unlocatedNodes = this.nodesData.filter((node) => {
       var _a2;

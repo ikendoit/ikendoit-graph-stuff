@@ -1,7 +1,7 @@
 {
 	"id": "ikendoit-graph-stuff",
 	"name": "ikendoit-graph-stuff",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"minAppVersion": "0.15.0",
 	"description": "Graph exploration for Obsidian notes across desktop and mobile.",
 	"author": "ikendoit",
