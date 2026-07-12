@@ -14389,6 +14389,7 @@ var AppContainer = class {
     this.mapAddressSearchResults = [];
     this.mapAddressSearchLoading = false;
     this.mapAddressSearchAbortController = null;
+    this.mapSectionExpanded = {};
     this.layoutObserver = null;
     this.layoutSyncFrameHandle = null;
     this.LABEL_RENDER_THRESHOLD = 120;
@@ -14454,6 +14455,37 @@ var AppContainer = class {
     var _a;
     (_a = this.layoutObserver) == null ? void 0 : _a.disconnect();
     this.layoutObserver = null;
+  }
+  isMobileMapLayout() {
+    return window.innerWidth <= 900;
+  }
+  getMapSectionExpanded(sectionKey, mobileDefaultExpanded) {
+    if (!(sectionKey in this.mapSectionExpanded)) {
+      this.mapSectionExpanded[sectionKey] = this.isMobileMapLayout() ? mobileDefaultExpanded : true;
+    }
+    return this.mapSectionExpanded[sectionKey];
+  }
+  buildMapUtilityCard(parent, config) {
+    var _a;
+    const section = parent.createDiv({
+      cls: ["ikg-map-mode__card", "ikg-map-mode__utility-card", ...(_a = config.extraClasses) != null ? _a : []].join(" ")
+    });
+    const expanded = this.getMapSectionExpanded(config.sectionKey, config.mobileDefaultExpanded);
+    section.classList.toggle("is-collapsed", !expanded);
+    const toggleButton = section.createEl("button", {
+      cls: "ikg-map-mode__utility-toggle",
+      attr: { type: "button", "aria-expanded": String(expanded) }
+    });
+    const toggleCopy = toggleButton.createDiv({ cls: "ikg-map-mode__utility-toggle-copy" });
+    toggleCopy.createDiv({ cls: "ikg-map-mode__card-eyebrow", text: config.eyebrow });
+    toggleCopy.createDiv({ cls: "ikg-map-mode__utility-title", text: config.title });
+    toggleButton.createDiv({ cls: "ikg-map-mode__utility-toggle-state", text: expanded ? "Hide" : "Show" });
+    toggleButton.addEventListener("click", () => {
+      this.mapSectionExpanded[config.sectionKey] = !this.getMapSectionExpanded(config.sectionKey, config.mobileDefaultExpanded);
+      this.refreshMapModeFromState();
+    });
+    const body = section.createDiv({ cls: "ikg-map-mode__utility-body" });
+    return { section, body };
   }
   ensureLayoutObserver() {
     var _a;
@@ -15217,11 +15249,16 @@ var AppContainer = class {
     this.destroyMapMode();
     const root2 = contentEl.createDiv({ cls: "ikg-map-mode" });
     const canvas = root2.createDiv({ cls: "ikg-map-mode__canvas" });
-    const searchCard = root2.createDiv({ cls: "ikg-map-mode__card ikg-map-mode__search-card" });
     const sidebar = root2.createDiv({ cls: "ikg-map-mode__sidebar" });
-    searchCard.createDiv({ cls: "ikg-map-mode__card-eyebrow", text: "Address search" });
-    searchCard.createDiv({ cls: "ikg-map-mode__card-copy", text: "Search an address, jump there, then save the red draft pin onto the selected node." });
-    const searchForm = searchCard.createDiv({ cls: "ikg-map-mode__compose" });
+    const { body: searchBody } = this.buildMapUtilityCard(root2, {
+      sectionKey: "address-search",
+      eyebrow: "Address search",
+      title: "Jump to a place",
+      mobileDefaultExpanded: false,
+      extraClasses: ["ikg-map-mode__search-card"]
+    });
+    searchBody.createDiv({ cls: "ikg-map-mode__card-copy", text: "Search an address, jump there, then save the red draft pin onto the selected node." });
+    const searchForm = searchBody.createDiv({ cls: "ikg-map-mode__compose" });
     const addressSearchInput = searchForm.createEl("input", {
       type: "search",
       placeholder: "Search address or place\u2026",
@@ -15231,8 +15268,8 @@ var AppContainer = class {
     const searchActions = searchForm.createDiv({ cls: "ikg-map-mode__actions" });
     const addressSearchButton = searchActions.createEl("button", { text: "Find address" });
     const clearAddressSearchButton = searchActions.createEl("button", { text: "Clear results" });
-    const searchStatus = searchCard.createDiv({ cls: "ikg-map-mode__card-copy", text: "Existing node pins stay visible while you jump around the map." });
-    const addressResults = searchCard.createDiv({ cls: "ikg-map-mode__list ikg-map-mode__address-results" });
+    const searchStatus = searchBody.createDiv({ cls: "ikg-map-mode__card-copy", text: "Existing node pins stay visible while you jump around the map." });
+    const addressResults = searchBody.createDiv({ cls: "ikg-map-mode__list ikg-map-mode__address-results" });
     const submitAddressSearch = () => {
       this.mapAddressSearchQuery = addressSearchInput.value;
       void this.searchMapAddresses(addressSearchInput.value);
@@ -15252,12 +15289,16 @@ var AppContainer = class {
       addressSearchInput.value = "";
       this.refreshMapModeFromState();
     });
-    const selectedCard = sidebar.createDiv({ cls: "ikg-map-mode__card" });
-    selectedCard.createDiv({ cls: "ikg-map-mode__card-eyebrow", text: "Selected node" });
-    const selectedTitle = selectedCard.createDiv({ cls: "ikg-map-mode__card-title", text: "Pick a node" });
-    const selectedMeta = selectedCard.createDiv({ cls: "ikg-map-mode__card-copy", text: "Click any node marker or choose a node from the lists below." });
-    const composeHint = selectedCard.createDiv({ cls: "ikg-map-mode__card-copy", text: "Click on the map to draft a new latitude/longitude pin for the selected node." });
-    const composeForm = selectedCard.createDiv({ cls: "ikg-map-mode__compose" });
+    const { body: selectedBody } = this.buildMapUtilityCard(sidebar, {
+      sectionKey: "selected-node",
+      eyebrow: "Selected node",
+      title: "Pin details and save",
+      mobileDefaultExpanded: true
+    });
+    const selectedTitle = selectedBody.createDiv({ cls: "ikg-map-mode__card-title", text: "Pick a node" });
+    const selectedMeta = selectedBody.createDiv({ cls: "ikg-map-mode__card-copy", text: "Click any node marker or choose a node from the lists below." });
+    const composeHint = selectedBody.createDiv({ cls: "ikg-map-mode__card-copy", text: "Click on the map to draft a new latitude/longitude pin for the selected node." });
+    const composeForm = selectedBody.createDiv({ cls: "ikg-map-mode__compose" });
     const labelInput = composeForm.createEl("input", {
       type: "text",
       placeholder: "Pin label",
@@ -15303,14 +15344,22 @@ var AppContainer = class {
         void submitDraft();
       }
     });
-    const locatedCard = sidebar.createDiv({ cls: "ikg-map-mode__card" });
-    locatedCard.createDiv({ cls: "ikg-map-mode__card-eyebrow", text: "Mapped nodes" });
-    const nodeCount = locatedCard.createDiv({ cls: "ikg-map-mode__card-title", text: "0 saved map pins" });
-    const locatedList = locatedCard.createDiv({ cls: "ikg-map-mode__list" });
-    const unlocatedCard = sidebar.createDiv({ cls: "ikg-map-mode__card" });
-    unlocatedCard.createDiv({ cls: "ikg-map-mode__card-eyebrow", text: "Nodes needing locations" });
-    unlocatedCard.createDiv({ cls: "ikg-map-mode__card-copy", text: "Search with the top bar, then click a node here to target it for a new pin." });
-    const unlocatedList = unlocatedCard.createDiv({ cls: "ikg-map-mode__list" });
+    const { body: locatedBody } = this.buildMapUtilityCard(sidebar, {
+      sectionKey: "mapped-nodes",
+      eyebrow: "Mapped nodes",
+      title: "Saved map pins",
+      mobileDefaultExpanded: false
+    });
+    const nodeCount = locatedBody.createDiv({ cls: "ikg-map-mode__card-title", text: "0 saved map pins" });
+    const locatedList = locatedBody.createDiv({ cls: "ikg-map-mode__list" });
+    const { body: unlocatedBody } = this.buildMapUtilityCard(sidebar, {
+      sectionKey: "nodes-needing-locations",
+      eyebrow: "Nodes needing locations",
+      title: "Pick a node to pin",
+      mobileDefaultExpanded: false
+    });
+    unlocatedBody.createDiv({ cls: "ikg-map-mode__card-copy", text: "Search with the top bar, then click a node here to target it for a new pin." });
+    const unlocatedList = unlocatedBody.createDiv({ cls: "ikg-map-mode__list" });
     this.mapModeRootEl = root2;
     this.mapModeCanvasEl = canvas;
     this.mapModeSidebarEl = sidebar;

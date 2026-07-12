@@ -456,6 +456,8 @@
 		"canvas sidebar";
 	gap: 14px;
 	align-items: start;
+	overflow: auto;
+	overscroll-behavior: contain;
 }
 
 .ikg-map-mode__canvas,
@@ -503,6 +505,57 @@
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
+}
+
+.ikg-map-mode__utility-toggle {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	width: 100%;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	text-align: left;
+}
+
+.ikg-map-mode__utility-toggle-copy {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.ikg-map-mode__utility-title {
+	font-size: 16px;
+	font-weight: 700;
+	line-height: 1.2;
+	color: #f8fbff;
+	word-break: break-word;
+}
+
+.ikg-map-mode__utility-toggle-state {
+	flex: 0 0 auto;
+	padding: 7px 10px;
+	border-radius: 999px;
+	background: rgba(255,255,255,0.08);
+	border: 1px solid rgba(255,255,255,0.12);
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: rgba(226, 232, 240, 0.86);
+}
+
+.ikg-map-mode__utility-body {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.ikg-map-mode__utility-card.is-collapsed .ikg-map-mode__utility-body {
+	display: none;
 }
 
 .ikg-map-mode__card-eyebrow {
@@ -801,22 +854,38 @@
 	.ikg-map-mode {
 		inset: var(--ikg-control-bar-offset) 12px calc(12px + env(safe-area-inset-bottom, 0px)) 12px;
 		grid-template-columns: 1fr;
-		grid-template-rows: auto minmax(260px, 38vh) minmax(0, 1fr);
+		grid-template-rows: auto minmax(260px, 46vh) auto;
 		grid-template-areas:
 			"search"
 			"canvas"
 			"sidebar";
+		align-content: start;
 	}
 
 	.ikg-map-mode__canvas {
 		min-height: 280px;
+		height: 46vh;
 	}
 
 	.ikg-map-mode__search-card {
-		max-height: min(32vh, 280px);
+		max-height: none;
+		overflow: visible;
 	}
 
 	.ikg-map-mode__address-results {
-		max-height: min(18vh, 160px);
+		max-height: min(22vh, 220px);
+	}
+
+	.ikg-map-mode__sidebar {
+		padding: 0;
+		background: transparent;
+		backdrop-filter: none;
+		border: 0;
+		box-shadow: none;
+		overflow: visible;
+	}
+
+	.ikg-map-mode__utility-toggle-state {
+		padding: 6px 9px;
 	}
 }
