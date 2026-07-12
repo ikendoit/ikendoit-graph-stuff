@@ -450,10 +450,16 @@
 	z-index: 12;
 	display: grid;
 	grid-template-columns: minmax(0, 1.5fr) minmax(320px, 420px);
+	grid-template-rows: auto minmax(0, 1fr);
+	grid-template-areas:
+		"canvas search"
+		"canvas sidebar";
 	gap: 14px;
+	align-items: start;
 }
 
 .ikg-map-mode__canvas,
+.ikg-map-mode__search-card,
 .ikg-map-mode__sidebar {
 	border-radius: 24px;
 	background: rgba(15, 23, 42, 0.82);
@@ -464,18 +470,28 @@
 }
 
 .ikg-map-mode__canvas {
+	grid-area: canvas;
 	min-height: 520px;
-	touch-action: none;
+	min-width: 0;
+	height: 100%;
 	overscroll-behavior: contain;
 	-webkit-user-select: none;
 	user-select: none;
 }
 
+.ikg-map-mode__search-card {
+	grid-area: search;
+	max-height: min(40vh, 360px);
+	overflow: auto;
+}
+
 .ikg-map-mode__sidebar {
+	grid-area: sidebar;
 	padding: 16px;
 	display: flex;
 	flex-direction: column;
 	gap: 12px;
+	min-height: 0;
 	overflow: auto;
 }
 
@@ -563,6 +579,11 @@
 	display: flex;
 	flex-direction: column;
 	gap: 8px;
+}
+
+.ikg-map-mode__address-results {
+	max-height: min(26vh, 220px);
+	overflow: auto;
 }
 
 .ikg-map-mode__list-item {
@@ -780,10 +801,22 @@
 	.ikg-map-mode {
 		inset: var(--ikg-control-bar-offset) 12px calc(12px + env(safe-area-inset-bottom, 0px)) 12px;
 		grid-template-columns: 1fr;
-		grid-template-rows: minmax(280px, 44vh) minmax(0, auto);
+		grid-template-rows: auto minmax(260px, 38vh) minmax(0, 1fr);
+		grid-template-areas:
+			"search"
+			"canvas"
+			"sidebar";
 	}
 
 	.ikg-map-mode__canvas {
 		min-height: 280px;
+	}
+
+	.ikg-map-mode__search-card {
+		max-height: min(32vh, 280px);
+	}
+
+	.ikg-map-mode__address-results {
+		max-height: min(18vh, 160px);
 	}
 }

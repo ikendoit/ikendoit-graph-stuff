@@ -733,15 +733,9 @@ class AppContainer {
 		const stopBubble = (event: Event) => {
 			event.stopPropagation();
 		};
-		const stopBubbleAndDefault = (event: Event) => {
-			event.stopPropagation();
-			if (event.cancelable) {
-				event.preventDefault();
-			}
-		};
 
 		this.mapModeCanvasEl.addEventListener('touchstart', stopBubble, { passive: false });
-		this.mapModeCanvasEl.addEventListener('touchmove', stopBubbleAndDefault, { passive: false });
+		this.mapModeCanvasEl.addEventListener('touchmove', stopBubble, { passive: false });
 		this.mapModeCanvasEl.addEventListener('touchend', stopBubble, { passive: false });
 		this.mapModeCanvasEl.addEventListener('touchcancel', stopBubble, { passive: false });
 		this.mapModeCanvasEl.addEventListener('pointerdown', stopBubble, { passive: true });
@@ -1493,9 +1487,8 @@ class AppContainer {
 
 		const root = contentEl.createDiv({ cls: 'ikg-map-mode' });
 		const canvas = root.createDiv({ cls: 'ikg-map-mode__canvas' });
+		const searchCard = root.createDiv({ cls: 'ikg-map-mode__card ikg-map-mode__search-card' });
 		const sidebar = root.createDiv({ cls: 'ikg-map-mode__sidebar' });
-
-		const searchCard = sidebar.createDiv({ cls: 'ikg-map-mode__card' });
 		searchCard.createDiv({ cls: 'ikg-map-mode__card-eyebrow', text: 'Address search' });
 		searchCard.createDiv({ cls: 'ikg-map-mode__card-copy', text: 'Search an address, jump there, then save the red draft pin onto the selected node.' });
 		const searchForm = searchCard.createDiv({ cls: 'ikg-map-mode__compose' });
@@ -1509,7 +1502,7 @@ class AppContainer {
 		const addressSearchButton = searchActions.createEl('button', { text: 'Find address' });
 		const clearAddressSearchButton = searchActions.createEl('button', { text: 'Clear results' });
 		const searchStatus = searchCard.createDiv({ cls: 'ikg-map-mode__card-copy', text: 'Existing node pins stay visible while you jump around the map.' });
-		const addressResults = searchCard.createDiv({ cls: 'ikg-map-mode__list' });
+		const addressResults = searchCard.createDiv({ cls: 'ikg-map-mode__list ikg-map-mode__address-results' });
 		const submitAddressSearch = () => {
 			this.mapAddressSearchQuery = addressSearchInput.value;
 			void this.searchMapAddresses(addressSearchInput.value);
