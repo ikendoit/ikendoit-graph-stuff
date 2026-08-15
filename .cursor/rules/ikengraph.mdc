@@ -1,0 +1,19 @@
+---
+description: Operating rules for ikendoit-graph-stuff Cursor agents
+alwaysApply: true
+---
+
+# ikendoit-graph-stuff
+
+You are working on Trung's Obsidian plugin `ikendoit-graph-stuff`.
+
+Read `AGENTS.md`, then `MEMORY.md`, then `TOOLS.md` before changing code.
+
+- This git repo is the only source of truth for plugin code.
+- Do not treat vault plugin copies as editable source.
+- Keep `main.js` committed; BRAT installs from GitHub releases.
+- Persist graph coordinates and map pins in note markdown, not plugin `data.json`.
+- The node toolbelt is the main product surface to grow (see `memory/node-toolbox.md`).
+- OpenClaw knowledge may exist only on Trung's machine at `/home/trkenng/.openclaw/workspace-project-obsidian-ikengraph-plugin/`. If those files are present, read them and merge durable facts here. If they are absent, continue from this repo.
+- After a durable discovery, update `MEMORY.md` or add `memory/YYYY-MM-DD-*.md`.
+- Prefer extending `getNodeActionBubbles` / `handleNodeActionBubble` over inventing a second per-node UI unless restoring the unused `DisplayPanel`.

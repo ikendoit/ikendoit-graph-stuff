@@ -1,10 +1,21 @@
 # AGENT GUIDE — ikendoit-graph-stuff
 
-This is the lightweight development handoff for future coding sessions.
+Lightweight pointer. The full Cursor-side knowledge base is:
+
+| File | Role |
+| --- | --- |
+| `AGENTS.md` | How Cursor agents should work this repo |
+| `MEMORY.md` | Durable project memory |
+| `TOOLS.md` | Build, BRAT, release, vault paths |
+| `memory/` | Topic notes (toolbox, architecture, OpenClaw sync) |
+
+OpenClaw companion (Trung's machine, not in git):
+
+`/home/trkenng/.openclaw/workspace-project-obsidian-ikengraph-plugin/`
 
 ## Project shape
 
-`ikendoit-graph-stuff` is an Obsidian plugin that reads markdown notes, builds graph data, and renders an interactive graph-oriented workspace with D3.
+`ikendoit-graph-stuff` is an Obsidian plugin that reads markdown notes, builds graph data, and renders an interactive graph-oriented workspace with D3, plus a Leaflet map mode.
 
 Primary files:
 
@@ -28,6 +39,8 @@ Primary files:
 - `npm run build`
 - `npm run sync-to-mobile-app`
 
+Details: `TOOLS.md`.
+
 ## Delivery model
 
 Preferred cross-platform delivery:
@@ -47,3 +60,7 @@ Secondary recovery path:
   - `manifest.json`
   - `styles.css`
   - `versions.json`
+
+## Current product focus
+
+Grow the **node toolbox** (hold-to-reveal bubbles) from show/unshow neighbors into a real per-node command surface. See `memory/node-toolbox.md`.
