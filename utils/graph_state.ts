@@ -20,6 +20,7 @@ export interface GraphNode {
 	vx?: number;
 	vy?: number;
 	image?: string | null;
+	imageCandidates?: string[];
 }
 
 export interface GraphLink {

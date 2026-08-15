@@ -14032,6 +14032,7 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
     super(...arguments);
     this.parsedFileCache = /* @__PURE__ */ new Map();
     this.imageBase64Cache = /* @__PURE__ */ new Map();
+    this.imageBase64Inflight = /* @__PURE__ */ new Map();
   }
   async onload() {
     await this.installSyncedPluginUpdate();
@@ -14087,20 +14088,21 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
         rootNodeIds.add(currentSelectedNodeId);
       } catch (err) {
       }
-      for (const file of files) {
-        const parsed = await this.parseMarkdownFile(file);
+      const parsedFiles = await Promise.all(files.map((file) => this.parseMarkdownFile(file)));
+      for (const parsed of parsedFiles) {
         if (parsed.isRootNode) {
           rootNodeIds.add(parsed.source);
         }
         nodesData.push({
           source: parsed.source,
-          nodeFilePath: file.path,
+          nodeFilePath: parsed.nodeFilePath,
           tags: parsed.tags,
           description: parsed.content,
           mapPositions: parsed.mapPositions,
           fx: (_b = (_a = parsed.persistedCoordinates) == null ? void 0 : _a.fx) != null ? _b : null,
           fy: (_d = (_c = parsed.persistedCoordinates) == null ? void 0 : _c.fy) != null ? _d : null,
-          image: parsed.image
+          image: defaultAvatar,
+          imageCandidates: parsed.imageCandidates
         });
         parsed.backlinks.forEach((link) => {
           if (InteractiveGraphPlugin.isMediaNode(link.target)) {
@@ -14115,6 +14117,7 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
       }
       const displayPanel = new canvas_panel_display_default(this.app, graphLeafBelow);
       const container = new AppContainer(
+        this,
         this.app,
         activeLeaf,
         graphLeafBelow,
@@ -14143,29 +14146,33 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
     const parsed = {
       content,
       source: InteractiveGraphPlugin.cleanNodeFileTextName(file.path),
+      nodeFilePath: file.path,
       isRootNode: content.includes("#ROOT_NODE"),
       backlinks: this.parseBacklinks(content),
       tags: this.extractTags(content, file.path),
       mapPositions: this.extractMapPositions(content),
       persistedCoordinates: this.extractFxFy(content),
-      image: await this.extractFirstImage(content)
+      imageCandidates: this.extractFirstImageCandidates(content)
     };
     this.parsedFileCache.set(cacheKey, { mtime: fileMtime, data: parsed });
     return parsed;
   }
   // bookmark__InteractiveGraphPlugin random Static-utilities
-  async extractFirstImage(content) {
+  extractFirstImageCandidates(content) {
     var _a;
     const imageRegex = /!\[\[([^\]]+)\]\]/g;
     const match = imageRegex.exec(content);
     if (!match) {
-      return defaultAvatar;
+      return [];
     }
     const imagePath = (_a = match[1].split("|")[0]) == null ? void 0 : _a.trim();
     if (!imagePath) {
-      return defaultAvatar;
+      return [];
     }
-    for (const candidatePath of [`images/${imagePath}`, imagePath]) {
+    return [`images/${imagePath}`, imagePath];
+  }
+  async extractFirstImage(content) {
+    for (const candidatePath of this.extractFirstImageCandidates(content)) {
       try {
         return await this.imageToBase64(candidatePath);
       } catch (err) {
@@ -14221,18 +14228,52 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
     }
     return window.btoa(binary);
   }
+  async resolveAvatar(imageCandidates) {
+    if (!imageCandidates || imageCandidates.length === 0) {
+      return defaultAvatar;
+    }
+    for (const candidatePath of imageCandidates) {
+      try {
+        return await this.imageToBase64(candidatePath);
+      } catch (_error) {
+        continue;
+      }
+    }
+    return defaultAvatar;
+  }
   async imageToBase64(relativePath) {
     const cacheKey = `${relativePath}@avatar`;
     const cached = this.imageBase64Cache.get(cacheKey);
+    if (cached === "") {
+      throw new Error(`Avatar miss: ${relativePath}`);
+    }
     if (cached) {
       return cached;
     }
-    const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
-    const resized = await this.resizeImageToAvatarDataUri(arrayBuffer);
-    const dataUri = resized != null ? resized : `data:image/png;base64,${InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer)}`;
-    this.imageBase64Cache.set(cacheKey, dataUri);
-    this.imageBase64Cache.set(relativePath, dataUri);
-    return dataUri;
+    const inflight = this.imageBase64Inflight.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+    const task = this.decodeAvatarToCache(relativePath, cacheKey);
+    this.imageBase64Inflight.set(cacheKey, task);
+    try {
+      return await task;
+    } finally {
+      this.imageBase64Inflight.delete(cacheKey);
+    }
+  }
+  async decodeAvatarToCache(relativePath, cacheKey) {
+    try {
+      const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
+      const resized = await this.resizeImageToAvatarDataUri(arrayBuffer);
+      const dataUri = resized != null ? resized : `data:image/png;base64,${InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer)}`;
+      this.imageBase64Cache.set(cacheKey, dataUri);
+      this.imageBase64Cache.set(relativePath, dataUri);
+      return dataUri;
+    } catch (error) {
+      this.imageBase64Cache.set(cacheKey, "");
+      throw error;
+    }
   }
   drawSquareCoverToCanvas(source, sourceWidth, sourceHeight, size) {
     const canvas = document.createElement("canvas");
@@ -14400,7 +14441,7 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
   }
 };
 var AppContainer = class {
-  constructor(parentAppContainer, userTextEditorPanel, graphContainerPanel, displayPanelComponent, linksData, nodesData, rootNodeIds, currentSelectedNodeId) {
+  constructor(graphPlugin, parentAppContainer, userTextEditorPanel, graphContainerPanel, displayPanelComponent, linksData, nodesData, rootNodeIds, currentSelectedNodeId) {
     // D3-Transformer-Zoom Object
     this.currentTransform = identity2;
     this.diagnosticsPanelEl = null;
@@ -14451,11 +14492,15 @@ var AppContainer = class {
     this.layoutSyncFrameHandle = null;
     this.graphNodeSelection = null;
     this.graphLinkSelection = null;
+    this.graphZoomLayer = null;
+    this.graphLinksLayer = null;
+    this.graphNodesLayer = null;
     this.nodeElementLookup = /* @__PURE__ */ new Map();
     this.incidentLinkEnds = /* @__PURE__ */ new Map();
     this.boxedNodesLookup = {};
     this.simulationSettled = false;
     this.simulationAutoStopHandle = null;
+    this.paintRafHandle = null;
     this.graphIsDragging = false;
     this.renderedVisibleNodeCount = 0;
     this.liteGraphPaint = false;
@@ -14467,6 +14512,7 @@ var AppContainer = class {
     this.MOBILE_IMAGE_RENDER_THRESHOLD = 36;
     this.linksData = linksData;
     this.nodesData = nodesData;
+    this.graphPlugin = graphPlugin;
     this.graphState = new GraphState({
       nodes: nodesData,
       links: linksData,
@@ -14618,12 +14664,19 @@ var AppContainer = class {
       window.clearTimeout(this.simulationAutoStopHandle);
       this.simulationAutoStopHandle = null;
     }
+    if (this.paintRafHandle != null) {
+      window.cancelAnimationFrame(this.paintRafHandle);
+      this.paintRafHandle = null;
+    }
     (_a = this.simulation) == null ? void 0 : _a.stop();
     this.simulation = null;
     this.simulationSettled = false;
     this.graphIsDragging = false;
     this.graphNodeSelection = null;
     this.graphLinkSelection = null;
+    this.graphZoomLayer = null;
+    this.graphLinksLayer = null;
+    this.graphNodesLayer = null;
     this.nodeElementLookup = /* @__PURE__ */ new Map();
     this.incidentLinkEnds = /* @__PURE__ */ new Map();
     this.boxedNodesLookup = {};
@@ -14631,7 +14684,15 @@ var AppContainer = class {
     this.renderedNodeLookup = /* @__PURE__ */ new Map();
   }
   async rerenderGraph() {
+    var _a, _b, _c;
     this.destroyMapMode();
+    if (((_c = (_b = (_a = this.svg) == null ? void 0 : _a.node) == null ? void 0 : _b.call(_a)) == null ? void 0 : _c.isConnected) && this.graphNodesLayer && this.graphLinksLayer && this.simulation) {
+      const patched = await this.patchCanvasGraphDisplay();
+      if (patched) {
+        await this.bootstrapControlPlaneOnCanvas(this.svg);
+        return;
+      }
+    }
     this.clearGraphCanvas();
     const svg = await this.bootstrapCanvasGraphDisplay();
     await this.bootstrapControlPlaneOnCanvas(svg);
@@ -14881,6 +14942,94 @@ var AppContainer = class {
     }
     return visibleIds.every((nodeId) => this.renderedNodeLookup.has(nodeId));
   }
+  getDirectedLinkKey(link) {
+    var _a, _b, _c;
+    const sourceId = typeof link.source === "object" ? link.source.id : String((_a = link.source) != null ? _a : "");
+    const targetId = typeof link.target === "object" ? link.target.id : String((_b = link.target) != null ? _b : "");
+    return `${sourceId}\0${targetId}\0${(_c = link.zIndex) != null ? _c : ""}`;
+  }
+  collectRenderNodesAndLinks() {
+    var _a;
+    const visibleLinks = this.graphState.getVisibleLinks();
+    const previousNodes = this.renderedNodeLookup;
+    const previousLinks = /* @__PURE__ */ new Map();
+    (_a = this.graphLinkSelection) == null ? void 0 : _a.each((link) => {
+      previousLinks.set(this.getDirectedLinkKey(link), link);
+    });
+    const nodesById = /* @__PURE__ */ new Map();
+    this.graphState.getVisibleNodes().forEach((d) => {
+      var _a2, _b, _c, _d;
+      if (nodesById.has(d.source)) {
+        return;
+      }
+      const prior = previousNodes.get(d.source);
+      if (prior) {
+        prior.image = d.image && d.image !== defaultAvatar ? d.image : (_a2 = prior.image) != null ? _a2 : defaultAvatar;
+        prior.imageCandidates = d.imageCandidates;
+        prior.nodeFilePath = d.nodeFilePath;
+        if (d.fx != null) {
+          prior.fx = d.fx;
+          prior.x = d.fx;
+        }
+        if (d.fy != null) {
+          prior.fy = d.fy;
+          prior.y = d.fy;
+        }
+        nodesById.set(d.source, prior);
+        return;
+      }
+      nodesById.set(d.source, {
+        id: d.source,
+        image: (_b = d.image) != null ? _b : defaultAvatar,
+        imageCandidates: d.imageCandidates,
+        nodeFilePath: d.nodeFilePath,
+        fx: (_c = d.fx) != null ? _c : null,
+        fy: (_d = d.fy) != null ? _d : null,
+        x: d.x,
+        y: d.y,
+        vx: 0,
+        vy: 0,
+        avatarHydrated: Boolean(d.image && d.image !== defaultAvatar)
+      });
+    });
+    const nodes = Array.from(nodesById.values());
+    this.seedUnpinnedNodePositions(nodes);
+    const links = this.uniqueJsonArray(visibleLinks).map((d) => {
+      var _a2, _b;
+      const key = `${d.source}\0${d.target}\0${(_a2 = d.zIndex) != null ? _a2 : ""}`;
+      return (_b = previousLinks.get(key)) != null ? _b : Object.create(d);
+    });
+    return { nodes, links };
+  }
+  async hydrateVisibleAvatars(nodes) {
+    await Promise.all(nodes.map(async (node) => {
+      var _a;
+      if (node.avatarHydrated) {
+        return;
+      }
+      if (node.image && node.image !== defaultAvatar) {
+        node.avatarHydrated = true;
+        return;
+      }
+      const resolved = await this.graphPlugin.resolveAvatar(node.imageCandidates);
+      node.image = resolved;
+      node.avatarHydrated = true;
+      const nodeId = (_a = node.id) != null ? _a : node.source;
+      const graphNode = nodeId ? this.graphState.getNodeById(nodeId) : null;
+      if (graphNode) {
+        graphNode.image = resolved;
+      }
+    }));
+  }
+  scheduleGraphPaint() {
+    if (this.paintRafHandle != null) {
+      return;
+    }
+    this.paintRafHandle = window.requestAnimationFrame(() => {
+      this.paintRafHandle = null;
+      this.paintGraphFrame();
+    });
+  }
   seedUnpinnedNodePositions(nodes) {
     var _a, _b, _c, _d, _e;
     const unpinned = nodes.filter((node) => node.fx == null || node.fy == null);
@@ -14946,12 +15095,33 @@ var AppContainer = class {
       alpha: (_h = (_g = (_f = this.simulation) == null ? void 0 : _f.alpha) == null ? void 0 : _g.call(_f)) != null ? _h : 0
     });
   }
-  paintGraphFrame() {
-    var _a, _b;
-    (_a = this.graphLinkSelection) == null ? void 0 : _a.attr("x1", (d) => d.source.x).attr("y1", (d) => d.source.y).attr("x2", (d) => d.target.x).attr("y2", (d) => d.target.y);
-    (_b = this.graphNodeSelection) == null ? void 0 : _b.attr("transform", (d) => {
-      var _a2, _b2;
-      return `translate(${(_a2 = d.x) != null ? _a2 : 0},${(_b2 = d.y) != null ? _b2 : 0})`;
+  paintGraphFrame(force = false) {
+    this.renderedNodeLookup.forEach((node, nodeId) => {
+      var _a, _b, _c, _d;
+      const x3 = Math.round((_b = (_a = node.x) != null ? _a : node.fx) != null ? _b : 0);
+      const y3 = Math.round((_d = (_c = node.y) != null ? _c : node.fy) != null ? _d : 0);
+      if (!force && node._px === x3 && node._py === y3) {
+        return;
+      }
+      node._px = x3;
+      node._py = y3;
+      const nodeEl = this.nodeElementLookup.get(nodeId);
+      if (nodeEl) {
+        nodeEl.setAttribute("transform", `translate(${x3},${y3})`);
+      }
+      const incident = this.incidentLinkEnds.get(nodeId);
+      if (!incident) {
+        return;
+      }
+      for (const item of incident) {
+        if (item.end === "source") {
+          item.el.setAttribute("x1", String(x3));
+          item.el.setAttribute("y1", String(y3));
+        } else {
+          item.el.setAttribute("x2", String(x3));
+          item.el.setAttribute("y2", String(y3));
+        }
+      }
     });
   }
   constrainDragPosition(nodeId, x3, y3) {
@@ -14971,6 +15141,8 @@ var AppContainer = class {
     d.fy = y3;
     d.vx = 0;
     d.vy = 0;
+    d._px = Math.round(x3);
+    d._py = Math.round(y3);
     this.graphState.updateNodeCoordinates(d.id, { fx: x3, fy: y3 });
     const nodeEl = this.nodeElementLookup.get(d.id);
     if (nodeEl) {
@@ -15768,6 +15940,19 @@ var AppContainer = class {
       return !hasLatLng && this.nodeMatchesCurrentSearch(node);
     });
     const selectedNode = this.currentSelectedNodeId ? this.graphState.getNodeById(this.currentSelectedNodeId) : null;
+    const mapAvatarNodes = [];
+    const seenAvatarIds = /* @__PURE__ */ new Set();
+    for (const record of locatedRecords) {
+      if (seenAvatarIds.has(record.node.source)) {
+        continue;
+      }
+      seenAvatarIds.add(record.node.source);
+      mapAvatarNodes.push(record.node);
+    }
+    if (selectedNode && !seenAvatarIds.has(selectedNode.source)) {
+      mapAvatarNodes.push(selectedNode);
+    }
+    await this.hydrateVisibleAvatars(mapAvatarNodes);
     const selectedRecord = this.getSelectedNodeLatestLocatedRecord();
     const autoFrameRecord = this.mapAutoFrameNodeId ? (_a = this.getAllLocatedRecords().filter((record) => record.node.source === this.mapAutoFrameNodeId).at(-1)) != null ? _a : null : selectedRecord;
     this.mapSelectionTitleEl.setText((_b = selectedNode == null ? void 0 : selectedNode.source) != null ? _b : "Pick a node");
@@ -15897,32 +16082,8 @@ var AppContainer = class {
     const contentEl = this.graphContainerPanel.view.containerEl;
     const svg = select_default2(contentEl).append("svg").attr("width", "100%").attr("height", "100%").attr("viewBox", "0 0 800 600").attr("preserveAspectRatio", "xMidYMid meet").style("z-index", "0").classed("ikg-graph-svg", true);
     this.svg = svg;
-    const width = SVG_WIDTH;
-    const height = SVG_HEIGHT;
-    const visibleLinks = this.graphState.getVisibleLinks();
-    const links = this.uniqueJsonArray(visibleLinks).map(
-      (d) => Object.create(d)
-    );
-    const nodesById = /* @__PURE__ */ new Map();
-    const visibleNodes = this.graphState.getVisibleNodes();
-    visibleNodes.forEach((d) => {
-      var _a;
-      if (!nodesById.has(d.source)) {
-        nodesById.set(d.source, {
-          id: d.source,
-          image: (_a = d.image) != null ? _a : defaultAvatar,
-          nodeFilePath: d.nodeFilePath,
-          fx: d.fx,
-          fy: d.fy,
-          x: d.x,
-          y: d.y,
-          vx: d.vx,
-          vy: d.vy
-        });
-      }
-    });
-    const nodes = Array.from(nodesById.values());
-    this.seedUnpinnedNodePositions(nodes);
+    const { nodes, links } = this.collectRenderNodesAndLinks();
+    await this.hydrateVisibleAvatars(nodes);
     const boxedNodes = {};
     const visibleNodeCount = nodes.length;
     const visibleLinkCount = links.length;
@@ -16004,7 +16165,9 @@ var AppContainer = class {
         this.syncSelectionAndToolbelt(null);
       }
     });
-    const link = zoomableGraphContainer.append("g").attr("stroke", "rgba(149, 193, 255, 0.72)").attr("stroke-opacity", 0.9).attr("stroke-width", visibleNodeCount > 40 ? 1.5 : 2.4).attr("marker-end", "url(#arrowhead)").selectAll("line").data(links).join("line");
+    this.graphZoomLayer = zoomableGraphContainer;
+    this.graphLinksLayer = zoomableGraphContainer.append("g").attr("class", "ikg-link-layer").attr("stroke", "rgba(149, 193, 255, 0.72)").attr("stroke-opacity", 0.9).attr("stroke-width", visibleNodeCount > 40 ? 1.5 : 2.4).attr("marker-end", "url(#arrowhead)");
+    const link = this.graphLinksLayer.selectAll("line").data(links, (d) => this.getDirectedLinkKey(d)).join("line");
     if (shouldRenderDecorations) {
       zoomableGraphContainer.append("g").selectAll("rect").data(box_encapsulations).join("rect").attr("x", (d) => d.x).attr("y", (d) => d.y).attr("width", (d) => d.width).attr("height", (d) => d.height).attr("fill", "none").attr("stroke", "orange").attr("stroke-width", 20).call(dragBoundingBoxesBehavior(nodes, boxedNodes));
     }
@@ -16040,45 +16203,25 @@ var AppContainer = class {
       return drag_default().on("start", dragstarted).on("drag", dragged).on("end", dragended);
     }
     if (shouldRenderDecorations) {
+      const width = SVG_WIDTH;
+      const height = SVG_HEIGHT;
       zoomableGraphContainer.append("line").attr("x1", 0).attr("y1", 0).attr("x2", 0).attr("y2", 0.8 * height).attr("stroke", "lightgreen").attr("stroke-width", 2).attr("marker-end", "url(#arrow)");
       zoomableGraphContainer.append("line").attr("x1", 0).attr("y1", 0).attr("x2", 0.8 * width).attr("y2", 0).attr("stroke", "lightblue").attr("stroke-width", 2).attr("marker-end", "url(#arrow)");
     }
-    const node = zoomableGraphContainer.append("g").attr("stroke", "#fff").attr("stroke-width", 1.5).selectAll("g").data(nodes).join("g").attr("class", (d) => `ikg-node-group${d.id === this.currentSelectedNodeId ? " is-selected" : ""}`).attr("data-box", (d) => boxedNodes[d.id] ? boxedNodes[d.id].Id : null).attr("data-node-id", (d) => d.id).call(this.createNodeDragHandler(simulation)).on("pointerdown", (event, d) => {
-      event.stopPropagation();
-      this.beginNodeHold(event, d, event.currentTarget);
-    }).on("pointerup", () => this.cancelNodeHold()).on("pointerleave", () => this.cancelNodeHold()).on("pointercancel", () => this.cancelNodeHold()).on("click", (event, d) => this.handleNodePrimaryTap(event, d));
+    this.graphNodesLayer = zoomableGraphContainer.append("g").attr("class", "ikg-node-layer").attr("stroke", "#fff").attr("stroke-width", 1.5);
+    const node = this.bindNodeSelection(
+      this.graphNodesLayer.selectAll("g.ikg-node-group").data(nodes, (d) => d.id).join("g"),
+      simulation,
+      boxedNodes,
+      visibleNodeCount,
+      litePaint,
+      true
+    );
     this.graphNodeSelection = node;
     this.graphLinkSelection = link;
-    this.nodeElementLookup = /* @__PURE__ */ new Map();
-    node.each((d, index2, groups) => {
-      this.nodeElementLookup.set(d.id, groups[index2]);
-    });
+    this.captureGraphElementLookups(node);
     this.indexIncidentLinks();
-    node.append("circle").attr("class", "ikg-node-hold-ring").attr("r", RADIUS_NODE + 16).attr("fill", "none").attr("stroke", "rgba(244, 114, 182, 0.95)").attr("stroke-width", 6).attr("stroke-linecap", "round").attr("transform", "rotate(-90)").style("opacity", 0).style("display", "none").style("pointer-events", "none");
-    node.append("circle").attr("class", "ikg-node-core").attr("r", RADIUS_NODE).attr("stroke", (d) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds)).attr("stroke-width", (d) => d.id === this.currentSelectedNodeId ? 5 : 3).attr(
-      "fill",
-      (d) => this.identifyColorForNodeCircle(
-        d.id,
-        this.rootNodeIds,
-        this.currentSelectedNodeId,
-        this.searchResultNodeIds
-      )
-    );
-    node.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("rect").attr("width", WIDTH_NODE_TITLE_BAR + 36).attr("height", HEIGHT_NODE_TITLE_BAR + 8).attr("rx", 16).attr("ry", 16).attr("x", -(WIDTH_NODE_TITLE_BAR + 28) / 2).attr("y", RADIUS_NODE + 10).attr("fill", "rgba(15, 23, 42, 0.64)").attr("stroke", "rgba(191, 219, 254, 0.16)").attr("stroke-width", 1);
-    node.append("image").attr("class", "ikg-node-avatar").attr("clip-path", "url(#ikg-avatar-clip)").attr("href", (d) => {
-      var _a;
-      return (_a = d.image) != null ? _a : defaultAvatar;
-    }).attr("xlink:href", (d) => {
-      var _a;
-      return (_a = d.image) != null ? _a : defaultAvatar;
-    }).attr("x", -NODE_IMAGE_SIZE / 2).attr("y", -NODE_IMAGE_SIZE / 2).attr("width", NODE_IMAGE_SIZE).attr("height", NODE_IMAGE_SIZE).attr("preserveAspectRatio", "xMidYMid slice").style("pointer-events", "none");
-    const labelText = node.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("x", 0).attr("y", RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(248, 250, 252, 0.96)").attr("stroke", "rgba(15, 23, 42, 0.92)").attr("stroke-width", 0.75).attr("paint-order", "stroke").attr("font-size", visibleNodeCount > 80 ? 9 : 10.5).attr("font-weight", 450).style("font-family", "var(--font-interface)").text((d) => d.id.length > 18 ? `${d.id.slice(0, 18)}\u2026` : d.id);
-    if (!litePaint) {
-      labelText.style("text-rendering", "geometricPrecision").style("shape-rendering", "geometricPrecision").style("-webkit-font-smoothing", "antialiased");
-    }
-    node.append("circle").attr("cx", -RADIUS_NODE * 0.68).attr("cy", -RADIUS_NODE * 0.68).attr("r", 14).attr("fill", (d) => this.canNodeExpand(d.id) ? "rgba(34,197,94,0.95)" : this.canNodeCollapse(d.id) ? "rgba(245,158,11,0.95)" : "rgba(100,116,139,0.82)").attr("stroke", "rgba(255,255,255,0.85)").attr("stroke-width", 1.5);
-    node.append("text").attr("x", -RADIUS_NODE * 0.68).attr("y", -RADIUS_NODE * 0.68 + 0.5).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", 13).attr("font-weight", 700).style("pointer-events", "none").style("font-family", "var(--font-interface)").text((d) => this.canNodeExpand(d.id) ? "+" : this.canNodeCollapse(d.id) ? "\u2013" : "\u2022");
-    node.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("x", RADIUS_NODE * 0.8).attr("y", -RADIUS_NODE).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(147, 197, 253, 0.88)").attr("font-size", 10).attr("font-weight", 600).text((d) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+    this.paintGraphFrame(true);
     if (this.activeNodeToolbeltId) {
       const toolbeltHost = this.nodeElementLookup.get(this.activeNodeToolbeltId);
       if (toolbeltHost) {
@@ -16087,7 +16230,7 @@ var AppContainer = class {
     }
     let lastDiagnosticsUpdate = 0;
     simulation.on("tick", () => {
-      this.paintGraphFrame();
+      this.scheduleGraphPaint();
       if (!this.diagnosticsVisible) {
         return;
       }
@@ -16158,6 +16301,146 @@ var AppContainer = class {
       }, litePaint ? 800 : visibleNodeCount > 40 ? 1200 : 2200);
     }
     return svg;
+  }
+  bindNodeSelection(selection2, simulation, boxedNodes, visibleNodeCount, litePaint, decorateAll) {
+    selection2.attr("class", (d) => `ikg-node-group${d.id === this.currentSelectedNodeId ? " is-selected" : ""}${d.id === this.activeNodeToolbeltId ? " is-toolbelt-host" : ""}`).attr("data-box", (d) => boxedNodes[d.id] ? boxedNodes[d.id].Id : null).attr("data-node-id", (d) => d.id).call(this.createNodeDragHandler(simulation)).on("pointerdown", (event, d) => {
+      event.stopPropagation();
+      this.beginNodeHold(event, d, event.currentTarget);
+    }).on("pointerup", () => this.cancelNodeHold()).on("pointerleave", () => this.cancelNodeHold()).on("pointercancel", () => this.cancelNodeHold()).on("click", (event, d) => this.handleNodePrimaryTap(event, d));
+    if (decorateAll) {
+      this.decorateGraphNodeSelection(selection2, visibleNodeCount, litePaint);
+    }
+    return selection2;
+  }
+  decorateGraphNodeSelection(selection2, visibleNodeCount, litePaint) {
+    selection2.append("circle").attr("class", "ikg-node-hold-ring").attr("r", RADIUS_NODE + 16).attr("fill", "none").attr("stroke", "rgba(244, 114, 182, 0.95)").attr("stroke-width", 6).attr("stroke-linecap", "round").attr("transform", "rotate(-90)").style("opacity", 0).style("display", "none").style("pointer-events", "none");
+    selection2.append("circle").attr("class", "ikg-node-core").attr("r", RADIUS_NODE).attr("stroke", (d) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds)).attr("stroke-width", (d) => d.id === this.currentSelectedNodeId ? 5 : 3).attr(
+      "fill",
+      (d) => this.identifyColorForNodeCircle(
+        d.id,
+        this.rootNodeIds,
+        this.currentSelectedNodeId,
+        this.searchResultNodeIds
+      )
+    );
+    selection2.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("rect").attr("class", "ikg-node-label-bg").attr("width", WIDTH_NODE_TITLE_BAR + 36).attr("height", HEIGHT_NODE_TITLE_BAR + 8).attr("rx", 16).attr("ry", 16).attr("x", -(WIDTH_NODE_TITLE_BAR + 28) / 2).attr("y", RADIUS_NODE + 10).attr("fill", "rgba(15, 23, 42, 0.64)").attr("stroke", "rgba(191, 219, 254, 0.16)").attr("stroke-width", 1).style("pointer-events", "none");
+    selection2.append("image").attr("class", "ikg-node-avatar").attr("clip-path", "url(#ikg-avatar-clip)").attr("href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    }).attr("xlink:href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    }).attr("x", -NODE_IMAGE_SIZE / 2).attr("y", -NODE_IMAGE_SIZE / 2).attr("width", NODE_IMAGE_SIZE).attr("height", NODE_IMAGE_SIZE).attr("preserveAspectRatio", "xMidYMid slice").style("pointer-events", "none");
+    const labelText = selection2.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("class", "ikg-node-label").attr("x", 0).attr("y", RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(248, 250, 252, 0.96)").attr("stroke", "rgba(15, 23, 42, 0.92)").attr("stroke-width", 0.75).attr("paint-order", "stroke").attr("font-size", visibleNodeCount > 80 ? 9 : 10.5).attr("font-weight", 450).style("font-family", "var(--font-interface)").style("pointer-events", "none").text((d) => d.id.length > 18 ? `${d.id.slice(0, 18)}\u2026` : d.id);
+    if (!litePaint) {
+      labelText.style("text-rendering", "geometricPrecision").style("shape-rendering", "geometricPrecision").style("-webkit-font-smoothing", "antialiased");
+    }
+    selection2.append("circle").attr("class", "ikg-node-badge").attr("cx", -RADIUS_NODE * 0.68).attr("cy", -RADIUS_NODE * 0.68).attr("r", 14).attr("fill", (d) => this.canNodeExpand(d.id) ? "rgba(34,197,94,0.95)" : this.canNodeCollapse(d.id) ? "rgba(245,158,11,0.95)" : "rgba(100,116,139,0.82)").attr("stroke", "rgba(255,255,255,0.85)").attr("stroke-width", 1.5);
+    selection2.append("text").attr("class", "ikg-node-badge-label").attr("x", -RADIUS_NODE * 0.68).attr("y", -RADIUS_NODE * 0.68 + 0.5).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", 13).attr("font-weight", 700).style("pointer-events", "none").style("font-family", "var(--font-interface)").text((d) => this.canNodeExpand(d.id) ? "+" : this.canNodeCollapse(d.id) ? "\u2013" : "\u2022");
+    selection2.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("class", "ikg-node-neighbor-count").attr("x", RADIUS_NODE * 0.8).attr("y", -RADIUS_NODE).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(147, 197, 253, 0.88)").attr("font-size", 10).attr("font-weight", 600).style("pointer-events", "none").text((d) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+  }
+  syncGraphNodeChrome(selection2, visibleNodeCount) {
+    selection2.attr("class", (d) => `ikg-node-group${d.id === this.currentSelectedNodeId ? " is-selected" : ""}${d.id === this.activeNodeToolbeltId ? " is-toolbelt-host" : ""}`).attr("data-node-id", (d) => d.id);
+    selection2.select(".ikg-node-core").attr("stroke", (d) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds)).attr("stroke-width", (d) => d.id === this.currentSelectedNodeId ? 5 : 3).attr(
+      "fill",
+      (d) => this.identifyColorForNodeCircle(
+        d.id,
+        this.rootNodeIds,
+        this.currentSelectedNodeId,
+        this.searchResultNodeIds
+      )
+    );
+    selection2.select(".ikg-node-avatar").attr("href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    }).attr("xlink:href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    });
+    selection2.select(".ikg-node-badge").attr("fill", (d) => this.canNodeExpand(d.id) ? "rgba(34,197,94,0.95)" : this.canNodeCollapse(d.id) ? "rgba(245,158,11,0.95)" : "rgba(100,116,139,0.82)");
+    selection2.select(".ikg-node-badge-label").text((d) => this.canNodeExpand(d.id) ? "+" : this.canNodeCollapse(d.id) ? "\u2013" : "\u2022");
+    selection2.select(".ikg-node-neighbor-count").text((d) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+  }
+  captureGraphElementLookups(nodeSelection) {
+    this.nodeElementLookup = /* @__PURE__ */ new Map();
+    nodeSelection.each((d, index2, groups) => {
+      this.nodeElementLookup.set(d.id, groups[index2]);
+    });
+  }
+  async patchCanvasGraphDisplay() {
+    var _a, _b, _c, _d, _e, _f, _g;
+    if (!this.svg || !this.graphZoomLayer || !this.graphLinksLayer || !this.graphNodesLayer || !this.simulation) {
+      return false;
+    }
+    if (!((_a = this.svg.node()) == null ? void 0 : _a.isConnected) || !((_b = this.graphNodesLayer.node()) == null ? void 0 : _b.isConnected)) {
+      return false;
+    }
+    const { nodes, links } = this.collectRenderNodesAndLinks();
+    if (nodes.length === 0) {
+      return false;
+    }
+    const visibleNodeCount = nodes.length;
+    const visibleLinkCount = links.length;
+    const litePaint = this.shouldUseLiteGraphPaint(visibleNodeCount);
+    if (litePaint !== this.liteGraphPaint) {
+      return false;
+    }
+    await this.hydrateVisibleAvatars(nodes);
+    const boxedNodes = {};
+    box_encapsulations.forEach((box) => {
+      box.Nodes.forEach((nodeId) => {
+        boxedNodes[nodeId] = box;
+      });
+    });
+    this.boxedNodesLookup = boxedNodes;
+    this.renderedVisibleNodeCount = visibleNodeCount;
+    this.liteGraphPaint = litePaint;
+    this.svg.classed("ikg-lite-paint", litePaint);
+    this.graphLinksLayer.attr("stroke-width", visibleNodeCount > 40 ? 1.5 : 2.4);
+    const linkJoin = this.graphLinksLayer.selectAll("line").data(links, (d) => this.getDirectedLinkKey(d));
+    linkJoin.exit().remove();
+    linkJoin.enter().append("line");
+    this.graphLinkSelection = this.graphLinksLayer.selectAll("line");
+    const nodeJoin = this.graphNodesLayer.selectAll("g.ikg-node-group").data(nodes, (d) => d.id);
+    nodeJoin.exit().remove();
+    const nodeEnter = nodeJoin.enter().append("g").attr("class", "ikg-node-group");
+    this.bindNodeSelection(nodeEnter, this.simulation, boxedNodes, visibleNodeCount, litePaint, true);
+    this.graphNodeSelection = nodeEnter.merge(nodeJoin);
+    this.syncGraphNodeChrome(this.graphNodeSelection, visibleNodeCount);
+    this.captureGraphElementLookups(this.graphNodeSelection);
+    this.indexIncidentLinks();
+    this.renderedNodeLookup = new Map(nodes.map((node) => [node.id, node]));
+    this.simulation.nodes(nodes);
+    const linkForce = this.simulation.force("link");
+    (_c = linkForce == null ? void 0 : linkForce.links) == null ? void 0 : _c.call(linkForce, links);
+    const collideForce = this.simulation.force("collide");
+    (_d = collideForce == null ? void 0 : collideForce.radius) == null ? void 0 : _d.call(collideForce, (node) => this.getNodeCollisionRadius(node.id, visibleNodeCount));
+    this.simulation.stop();
+    this.simulationSettled = true;
+    if (this.activeNodeToolbeltId && !this.nodeElementLookup.has(this.activeNodeToolbeltId)) {
+      this.activeNodeToolbeltId = this.currentSelectedNodeId;
+    }
+    if (this.activeNodeToolbeltId) {
+      this.syncSelectionAndToolbelt(this.activeNodeToolbeltId);
+    } else {
+      this.refreshRenderedNodePaints();
+    }
+    this.paintGraphFrame(true);
+    const allNodesPinned = nodes.every((node) => node.fx != null && node.fy != null);
+    this.updateDiagnosticsPanel({
+      visibleNodes: visibleNodeCount,
+      visibleLinks: visibleLinkCount,
+      renderedLabels: nodes.filter((node) => this.shouldRenderNodeLabel(node.id, visibleNodeCount)).length,
+      renderedImages: nodes.filter((node) => this.shouldRenderNodeImage(node.id, visibleNodeCount)).length,
+      selectedNodeId: this.currentSelectedNodeId,
+      rootNodeCount: this.rootNodeIds.length,
+      collapsedNodeCount: this.collapsedNodeIds.length,
+      searchResultCount: this.searchResultNodeIds.length,
+      renderMode: litePaint ? "lite-static" : visibleNodeCount > this.getLabelRenderThreshold() ? "compact-rich" : "full-detail",
+      simulationStatus: allNodesPinned ? "patched-static" : "patched",
+      alpha: (_g = (_f = (_e = this.simulation).alpha) == null ? void 0 : _f.call(_e)) != null ? _g : 0
+    });
+    return true;
   }
   createNodeDragHandler(simulation) {
     const applyDragPosition = (event, d) => {
