@@ -277,7 +277,10 @@ export default class InteractiveGraphPlugin extends Plugin {
 			return defaultAvatar;
 		}
 
-		const imagePath = match[1];
+		const imagePath = match[1].split('|')[0]?.trim();
+		if (!imagePath) {
+			return defaultAvatar;
+		}
 		for (const candidatePath of [`images/${imagePath}`, imagePath]) {
 			try {
 				return await this.imageToBase64(candidatePath);
@@ -340,16 +343,70 @@ export default class InteractiveGraphPlugin extends Plugin {
 	}
 
 	async imageToBase64(relativePath: string): Promise<string> {
-		const cached = this.imageBase64Cache.get(relativePath);
+		const cacheKey = `${relativePath}@avatar`;
+		const cached = this.imageBase64Cache.get(cacheKey);
 		if (cached) {
 			return cached;
 		}
 
 		const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
-		const base64 = InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer);
-		const dataUri = `data:image/png;base64,${base64}`;
+		const resized = await this.resizeImageToAvatarDataUri(arrayBuffer);
+		const dataUri = resized ?? `data:image/png;base64,${InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer)}`;
+		this.imageBase64Cache.set(cacheKey, dataUri);
 		this.imageBase64Cache.set(relativePath, dataUri);
 		return dataUri;
+	}
+
+	private drawSquareCoverToCanvas(source: CanvasImageSource, sourceWidth: number, sourceHeight: number, size: number) {
+		const canvas = document.createElement('canvas');
+		canvas.width = size;
+		canvas.height = size;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) {
+			return null;
+		}
+		const minSide = Math.min(sourceWidth, sourceHeight) || size;
+		const sx = Math.max(0, (sourceWidth - minSide) / 2);
+		const sy = Math.max(0, (sourceHeight - minSide) / 2);
+		ctx.drawImage(source, sx, sy, minSide, minSide, 0, 0, size, size);
+		return canvas.toDataURL('image/jpeg', 0.7);
+	}
+
+	private async resizeImageToAvatarDataUri(arrayBuffer: ArrayBuffer): Promise<string | null> {
+		const size = Math.round(NODE_IMAGE_SIZE * 2);
+		const blob = new Blob([arrayBuffer]);
+		try {
+			if (typeof createImageBitmap === 'function') {
+				const bitmap = await createImageBitmap(blob);
+				const uri = this.drawSquareCoverToCanvas(bitmap, bitmap.width, bitmap.height, size);
+				bitmap.close?.();
+				if (uri) {
+					return uri;
+				}
+			}
+		} catch (error) {
+			console.warn('Avatar bitmap resize failed, trying Image fallback', error);
+		}
+
+		return await new Promise((resolve) => {
+			const objectUrl = URL.createObjectURL(blob);
+			const image = new Image();
+			image.onload = () => {
+				try {
+					resolve(this.drawSquareCoverToCanvas(image, image.naturalWidth, image.naturalHeight, size));
+				} catch (error) {
+					console.warn('Avatar canvas resize failed', error);
+					resolve(null);
+				} finally {
+					URL.revokeObjectURL(objectUrl);
+				}
+			};
+			image.onerror = () => {
+				URL.revokeObjectURL(objectUrl);
+				resolve(null);
+			};
+			image.src = objectUrl;
+		});
 	}
 
 	parseBacklinks(content: string) {
@@ -1114,6 +1171,30 @@ class AppContainer {
 		return visibleIds.every((nodeId) => this.renderedNodeLookup.has(nodeId));
 	}
 
+	private seedUnpinnedNodePositions(nodes: any[]) {
+		const unpinned = nodes.filter((node: any) => node.fx == null || node.fy == null);
+		if (unpinned.length === 0) {
+			return;
+		}
+		const originId = this.activeNodeToolbeltId ?? this.currentSelectedNodeId;
+		const originNode = originId ? this.graphState.getNodeById(originId) : null;
+		const ox = originNode?.fx ?? originNode?.x ?? SVG_WIDTH / 2;
+		const oy = originNode?.fy ?? originNode?.y ?? SVG_HEIGHT / 2;
+		const radius = Math.max(140, 48 + unpinned.length * 10);
+		unpinned.forEach((node: any, index: number) => {
+			const angle = -Math.PI / 2 + (index * 2 * Math.PI) / Math.max(unpinned.length, 1);
+			const x = ox + Math.cos(angle) * radius;
+			const y = oy + Math.sin(angle) * radius;
+			node.x = x;
+			node.y = y;
+			node.fx = x;
+			node.fy = y;
+			node.vx = 0;
+			node.vy = 0;
+			this.graphState.updateNodeCoordinates(node.id, { fx: x, fy: y });
+		});
+	}
+
 	private pinRenderedNodesInPlace() {
 		this.renderedNodeLookup.forEach((node: any, nodeId: string) => {
 			const x = node.fx ?? node.x;
@@ -1395,13 +1476,8 @@ class AppContainer {
 		);
 	}
 
-	private shouldRenderNodeImage(nodeId: string, visibleNodeCount: number) {
-		return (
-			visibleNodeCount <= this.getImageRenderThreshold() ||
-			nodeId === this.currentSelectedNodeId ||
-			this.rootNodeIds.includes(nodeId) ||
-			this.searchResultNodeIds.includes(nodeId)
-		);
+	private shouldRenderNodeImage(_nodeId: string, _visibleNodeCount: number) {
+		return true;
 	}
 
 	private isNodeCollapsed(nodeId: string) {
@@ -1487,8 +1563,7 @@ class AppContainer {
 		if (openNoteOnDesktop && !isMobile && leaves.length > 0) {
 			this.openInNewTabIfTabNotAlreadyOpened(d.nodeFilePath, this.parentAppContainer)
 		}
-		this.graphState.ensureNodeIsRoot(d.id)
-		this.currentSelectedNodeId = d.id
+		this.graphState.setCurrentSelectedNodeId(d.id)
 		void this.bootstrapControlPlaneOnCanvas(this.svg)
 		if (focusNode) {
 			this.focusOnNode(d.id)
@@ -1552,12 +1627,12 @@ class AppContainer {
 			if (this.canPanelExpand(d.id)) {
 				this.graphState.markNodeManuallyExpanded(d.id)
 			}
-			void this.refreshGraphAfterInteraction(d.id)
+			void this.refreshGraphAfterInteraction(d.id, { focusNode: true })
 			return
 		}
 		this.pendingSecondTapNodeId = d.id
 		this.pendingSecondTapExpiryMs = now + NODE_SECOND_TAP_WINDOW_MS
-		void this.refreshGraphAfterInteraction(d.id)
+		void this.refreshGraphAfterInteraction(d.id, { focusNode: false })
 	}
 
 	private getNodeActionBubbles(nodeId: string) {
@@ -2269,6 +2344,7 @@ class AppContainer {
 			}
 		});
 		const nodes = Array.from(nodesById.values());
+		this.seedUnpinnedNodePositions(nodes);
 
 		const boxedNodes: any = {};
 		const visibleNodeCount = nodes.length;
@@ -2347,8 +2423,15 @@ class AppContainer {
 		});
 
 		// bookmark__Add Custom-Shape-definitions: Arrow-Marks, etc
-		svg.append('defs')
-			.append('marker')
+		const svgDefs = svg.append('defs');
+		svgDefs.append('clipPath')
+			.attr('id', 'ikg-avatar-clip')
+			.attr('clipPathUnits', 'userSpaceOnUse')
+			.append('circle')
+			.attr('cx', 0)
+			.attr('cy', 0)
+			.attr('r', NODE_IMAGE_SIZE / 2);
+		svgDefs.append('marker')
 			.attr('id', 'arrowhead')
 			.attr('markerWidth', 40)
 			.attr('markerHeight', 40)
@@ -2359,9 +2442,7 @@ class AppContainer {
 			.append('polygon')
 			.attr('points', '0 0, 40 20, 0 40')
 			.attr('fill', 'black');
-		// Define an arrow marker for the end of each axis
-		svg.append('defs')
-			.append('marker')
+		svgDefs.append('marker')
 			.attr('id', 'arrow')
 			.attr('viewBox', '0 0 10 10')
 			.attr('refX', 5)
@@ -2573,14 +2654,16 @@ class AppContainer {
 			.attr('stroke', 'rgba(191, 219, 254, 0.16)')
 			.attr('stroke-width', 1);
 
-		node.filter((d: { id: string; }) => this.shouldRenderNodeImage(d.id, visibleNodeCount))
-			.append('image')
-			.attr('clip-path', 'circle(40px at center)')
+		node.append('image')
+			.attr('class', 'ikg-node-avatar')
+			.attr('clip-path', 'url(#ikg-avatar-clip)')
+			.attr('href', (d: { image: any; }) => d.image ?? defaultAvatar)
 			.attr('xlink:href', (d: { image: any; }) => d.image ?? defaultAvatar)
 			.attr('x', -NODE_IMAGE_SIZE / 2)
 			.attr('y', -NODE_IMAGE_SIZE / 2)
 			.attr('width', NODE_IMAGE_SIZE)
 			.attr('height', NODE_IMAGE_SIZE)
+			.attr('preserveAspectRatio', 'xMidYMid slice')
 			.style('pointer-events', 'none');
 
 		const labelText = node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))

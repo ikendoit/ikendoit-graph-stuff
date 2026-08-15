@@ -27,8 +27,8 @@
 	will-change: transform;
 }
 
-.ikg-node-core {
-	filter: none;
+.ikg-node-avatar {
+	pointer-events: none;
 }
 
 .ikg-graph-svg:not(.ikg-lite-paint) .ikg-node-group.is-selected .ikg-node-core {
