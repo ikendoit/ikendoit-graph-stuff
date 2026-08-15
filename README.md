@@ -68,3 +68,13 @@ That script updates the local runtime vault copy and publishes a synced release 
 
 - `main.js` is intentionally committed so BRAT can install directly from the repo.
 - `manifest.json`, `styles.css`, and `versions.json` stay at the repo root for Obsidian plugin compatibility.
+
+## For AI agents
+
+Cursor agents should start at `AGENTS.md`, then `MEMORY.md` and `TOOLS.md`.
+
+A separate OpenClaw knowledge workspace may exist on Trung's machine at:
+
+`/home/trkenng/.openclaw/workspace-project-obsidian-ikengraph-plugin/`
+
+That local store is a companion, not a replacement for this repo. Harmonization notes: `memory/openclaw-harmonization.md`.
