@@ -20,6 +20,7 @@ export interface GraphNode {
 	vx?: number;
 	vy?: number;
 	image?: string | null;
+	imageCandidates?: string[];
 }
 
 export interface GraphLink {
@@ -141,9 +142,6 @@ export class GraphState {
 
 	setCurrentSelectedNodeId(nodeId: string | null) {
 		this.currentSelectedNodeId = nodeId;
-		if (nodeId) {
-			this.rootNodeIds.add(nodeId);
-		}
 		this.recomputeVisibility();
 	}
 
@@ -292,12 +290,17 @@ export class GraphState {
 	}
 
 	private recomputeVisibility() {
+		const expansionSourceIds = new Set<string>(this.rootNodeIds);
+		this.manuallyExpandedNodeIds.forEach((nodeId) => expansionSourceIds.add(nodeId));
+
 		const initialDisplayable: string[] = [];
-		this.rootNodeIds.forEach((root) => initialDisplayable.push(root));
+		expansionSourceIds.forEach((nodeId) => initialDisplayable.push(nodeId));
 		if (this.currentSelectedNodeId) {
 			initialDisplayable.push(this.currentSelectedNodeId);
 		}
-		this.activeExpansionNodeIds = new Set(initialDisplayable);
+		this.activeExpansionNodeIds = new Set(
+			Array.from(expansionSourceIds).filter((nodeId) => !this.collapsedNodeIds.has(nodeId))
+		);
 
 		let connectedNodes: string[] = [...initialDisplayable];
 		const anchorNode = this.getAnchorNodeId();
@@ -325,7 +328,7 @@ export class GraphState {
 			}
 		}
 
-		for (const nodeId of initialDisplayable) {
+		for (const nodeId of expansionSourceIds) {
 			if (this.collapsedNodeIds.has(nodeId)) {
 				continue;
 			}

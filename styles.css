@@ -10,6 +10,33 @@
 
 .ikg-graph-svg {
 	background: transparent;
+	touch-action: none;
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+.ikg-graph-svg.ikg-is-dragging .ikg-node-group {
+	pointer-events: none;
+}
+
+.ikg-graph-svg.ikg-is-dragging .ikg-node-group.is-dragging {
+	pointer-events: auto;
+}
+
+.ikg-node-group.is-dragging {
+	will-change: transform;
+}
+
+.ikg-node-avatar {
+	pointer-events: none;
+}
+
+.ikg-graph-svg:not(.ikg-lite-paint) .ikg-node-group.is-selected .ikg-node-core {
+	filter: drop-shadow(0 10px 18px rgba(15, 23, 42, 0.28));
+}
+
+.ikg-lite-paint .ikg-node-toolbelt-aura {
+	animation: none;
 }
 
 .ikg-control-bar {
@@ -422,7 +449,7 @@
 }
 
 .ikg-node-action-bubble circle {
-	transition: transform 140ms ease, fill 140ms ease, stroke 140ms ease;
+	transition: none;
 }
 
 .ikg-node-action-bubble:hover circle {

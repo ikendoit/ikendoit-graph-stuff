@@ -124,6 +124,7 @@ interface SyncedReleaseManifest {
 export default class InteractiveGraphPlugin extends Plugin {
 	private parsedFileCache = new Map<string, { mtime: number; data: any }>();
 	private imageBase64Cache = new Map<string, string>();
+	private imageBase64Inflight = new Map<string, Promise<string>>();
 
 	async onload() {
 		await this.installSyncedPluginUpdate();
@@ -192,22 +193,22 @@ export default class InteractiveGraphPlugin extends Plugin {
 				rootNodeIds.add(currentSelectedNodeId)
 			} catch (err) { }
 
-			for (const file of files) {
-				const parsed = await this.parseMarkdownFile(file);
-
+			const parsedFiles = await Promise.all(files.map((file) => this.parseMarkdownFile(file)));
+			for (const parsed of parsedFiles) {
 				if (parsed.isRootNode) {
 					rootNodeIds.add(parsed.source)
 				}
 
 				nodesData.push({
 					source: parsed.source,
-					nodeFilePath: file.path,
+					nodeFilePath: parsed.nodeFilePath,
 					tags: parsed.tags,
 					description: parsed.content,
 					mapPositions: parsed.mapPositions,
 					fx: parsed.persistedCoordinates?.fx ?? null,
 					fy: parsed.persistedCoordinates?.fy ?? null,
-					image: parsed.image,
+					image: defaultAvatar,
+					imageCandidates: parsed.imageCandidates,
 				})
 
 				parsed.backlinks.forEach((link: any) => {
@@ -224,6 +225,7 @@ export default class InteractiveGraphPlugin extends Plugin {
 
 			const displayPanel = new DisplayPanel(this.app, graphLeafBelow)
 			const container = new AppContainer(
+				this,
 				this.app,
 				activeLeaf,
 				graphLeafBelow,
@@ -257,12 +259,13 @@ export default class InteractiveGraphPlugin extends Plugin {
 		const parsed = {
 			content,
 			source: InteractiveGraphPlugin.cleanNodeFileTextName(file.path),
+			nodeFilePath: file.path,
 			isRootNode: content.includes("#ROOT_NODE"),
 			backlinks: this.parseBacklinks(content),
 			tags: this.extractTags(content, file.path),
 			mapPositions: this.extractMapPositions(content),
 			persistedCoordinates: this.extractFxFy(content),
-			image: await this.extractFirstImage(content),
+			imageCandidates: this.extractFirstImageCandidates(content),
 		};
 
 		this.parsedFileCache.set(cacheKey, { mtime: fileMtime, data: parsed });
@@ -270,22 +273,27 @@ export default class InteractiveGraphPlugin extends Plugin {
 	}
 
 	// bookmark__InteractiveGraphPlugin random Static-utilities
-	async extractFirstImage(content: string) {
+	extractFirstImageCandidates(content: string): string[] {
 		const imageRegex = /!\[\[([^\]]+)\]\]/g;
 		const match = imageRegex.exec(content);
 		if (!match) {
-			return defaultAvatar;
+			return [];
 		}
+		const imagePath = match[1].split('|')[0]?.trim();
+		if (!imagePath) {
+			return [];
+		}
+		return [`images/${imagePath}`, imagePath];
+	}
 
-		const imagePath = match[1];
-		for (const candidatePath of [`images/${imagePath}`, imagePath]) {
+	async extractFirstImage(content: string) {
+		for (const candidatePath of this.extractFirstImageCandidates(content)) {
 			try {
 				return await this.imageToBase64(candidatePath);
 			} catch (err) {
 				continue;
 			}
 		}
-
 		return defaultAvatar;
 	}
 
@@ -339,17 +347,107 @@ export default class InteractiveGraphPlugin extends Plugin {
 		return window.btoa(binary);
 	}
 
+	async resolveAvatar(imageCandidates?: string[]): Promise<string> {
+		if (!imageCandidates || imageCandidates.length === 0) {
+			return defaultAvatar;
+		}
+		for (const candidatePath of imageCandidates) {
+			try {
+				return await this.imageToBase64(candidatePath);
+			} catch (_error) {
+				continue;
+			}
+		}
+		return defaultAvatar;
+	}
+
 	async imageToBase64(relativePath: string): Promise<string> {
-		const cached = this.imageBase64Cache.get(relativePath);
+		const cacheKey = `${relativePath}@avatar`;
+		const cached = this.imageBase64Cache.get(cacheKey);
+		if (cached === '') {
+			throw new Error(`Avatar miss: ${relativePath}`);
+		}
 		if (cached) {
 			return cached;
 		}
+		const inflight = this.imageBase64Inflight.get(cacheKey);
+		if (inflight) {
+			return inflight;
+		}
 
-		const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
-		const base64 = InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer);
-		const dataUri = `data:image/png;base64,${base64}`;
-		this.imageBase64Cache.set(relativePath, dataUri);
-		return dataUri;
+		const task = this.decodeAvatarToCache(relativePath, cacheKey);
+		this.imageBase64Inflight.set(cacheKey, task);
+		try {
+			return await task;
+		} finally {
+			this.imageBase64Inflight.delete(cacheKey);
+		}
+	}
+
+	private async decodeAvatarToCache(relativePath: string, cacheKey: string): Promise<string> {
+		try {
+			const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
+			const resized = await this.resizeImageToAvatarDataUri(arrayBuffer);
+			const dataUri = resized ?? `data:image/png;base64,${InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer)}`;
+			this.imageBase64Cache.set(cacheKey, dataUri);
+			this.imageBase64Cache.set(relativePath, dataUri);
+			return dataUri;
+		} catch (error) {
+			this.imageBase64Cache.set(cacheKey, '');
+			throw error;
+		}
+	}
+
+	private drawSquareCoverToCanvas(source: CanvasImageSource, sourceWidth: number, sourceHeight: number, size: number) {
+		const canvas = document.createElement('canvas');
+		canvas.width = size;
+		canvas.height = size;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) {
+			return null;
+		}
+		const minSide = Math.min(sourceWidth, sourceHeight) || size;
+		const sx = Math.max(0, (sourceWidth - minSide) / 2);
+		const sy = Math.max(0, (sourceHeight - minSide) / 2);
+		ctx.drawImage(source, sx, sy, minSide, minSide, 0, 0, size, size);
+		return canvas.toDataURL('image/jpeg', 0.7);
+	}
+
+	private async resizeImageToAvatarDataUri(arrayBuffer: ArrayBuffer): Promise<string | null> {
+		const size = Math.round(NODE_IMAGE_SIZE * 2);
+		const blob = new Blob([arrayBuffer]);
+		try {
+			if (typeof createImageBitmap === 'function') {
+				const bitmap = await createImageBitmap(blob);
+				const uri = this.drawSquareCoverToCanvas(bitmap, bitmap.width, bitmap.height, size);
+				bitmap.close?.();
+				if (uri) {
+					return uri;
+				}
+			}
+		} catch (error) {
+			console.warn('Avatar bitmap resize failed, trying Image fallback', error);
+		}
+
+		return await new Promise((resolve) => {
+			const objectUrl = URL.createObjectURL(blob);
+			const image = new Image();
+			image.onload = () => {
+				try {
+					resolve(this.drawSquareCoverToCanvas(image, image.naturalWidth, image.naturalHeight, size));
+				} catch (error) {
+					console.warn('Avatar canvas resize failed', error);
+					resolve(null);
+				} finally {
+					URL.revokeObjectURL(objectUrl);
+				}
+			};
+			image.onerror = () => {
+				URL.revokeObjectURL(objectUrl);
+				resolve(null);
+			};
+			image.src = objectUrl;
+		});
 	}
 
 	parseBacklinks(content: string) {
@@ -504,6 +602,7 @@ export default class InteractiveGraphPlugin extends Plugin {
 class AppContainer {
 // config: not create a split, but tops a Modal on top of current UI
 // class AppContainer extends Modal {
+	graphPlugin: InteractiveGraphPlugin;
 	graphState: GraphState;
 	nodesData: GraphNode[];
 	linksData: any[];
@@ -605,13 +704,43 @@ class AppContainer {
 	mapSectionExpanded: Record<string, boolean> = {};
 	layoutObserver: ResizeObserver | null = null;
 	layoutSyncFrameHandle: number | null = null;
+	graphNodeSelection: any = null;
+	graphLinkSelection: any = null;
+	graphZoomLayer: any = null;
+	graphLinksLayer: any = null;
+	graphNodesLayer: any = null;
+	nodeElementLookup: Map<string, SVGGElement> = new Map();
+	incidentLinkEnds: Map<string, Array<{ el: SVGLineElement; end: 'source' | 'target' }>> = new Map();
+	boxedNodesLookup: Record<string, any> = {};
+	simulationSettled = false;
+	simulationAutoStopHandle: number | null = null;
+	paintRafHandle: number | null = null;
+	graphIsDragging = false;
+	renderedVisibleNodeCount = 0;
+	liteGraphPaint = false;
+	lastDiagnosticsData: {
+		visibleNodes: number;
+		visibleLinks: number;
+		renderedLabels: number;
+		renderedImages: number;
+		selectedNodeId: string | null;
+		rootNodeCount: number;
+		collapsedNodeCount: number;
+		searchResultCount: number;
+		renderMode: string;
+		simulationStatus: string;
+		alpha?: number;
+	} | null = null;
 
 	private readonly LABEL_RENDER_THRESHOLD = 120;
 	private readonly IMAGE_RENDER_THRESHOLD = 90;
 	private readonly DECORATION_RENDER_THRESHOLD = 50;
+	private readonly MOBILE_LABEL_RENDER_THRESHOLD = 64;
+	private readonly MOBILE_IMAGE_RENDER_THRESHOLD = 36;
 
 
-	constructor(parentAppContainer: any,
+	constructor(graphPlugin: InteractiveGraphPlugin,
+		parentAppContainer: any,
 		userTextEditorPanel: WorkspaceLeaf,
 		graphContainerPanel: WorkspaceLeaf,
 		displayPanelComponent: any,
@@ -620,7 +749,8 @@ class AppContainer {
 		rootNodeIds: string[],
 		currentSelectedNodeId: string | null) {
 		/*
-			parentAppContainer: Obsidian.Plugin top level anchor reference
+			graphPlugin: InteractiveGraphPlugin instance (avatar cache, vault reads)
+			parentAppContainer: Obsidian App
 			userTextEditorPanel: Used for split-text-file view on Desktop Mode, currently disabled.
 				this is HTML-Div (Obsidian.workspaceLeaf) of the panel that 
 				User last Focused on before trigger plugin
@@ -641,6 +771,7 @@ class AppContainer {
 
 		this.linksData = linksData;
 		this.nodesData = nodesData;
+		this.graphPlugin = graphPlugin;
 		this.graphState = new GraphState({
 			nodes: nodesData,
 			links: linksData,
@@ -783,13 +914,39 @@ class AppContainer {
 
 	private clearGraphCanvas() {
 		const contentEl = this.graphContainerPanel.view.containerEl;
+		if (this.simulationAutoStopHandle != null) {
+			window.clearTimeout(this.simulationAutoStopHandle);
+			this.simulationAutoStopHandle = null;
+		}
+		if (this.paintRafHandle != null) {
+			window.cancelAnimationFrame(this.paintRafHandle);
+			this.paintRafHandle = null;
+		}
 		this.simulation?.stop();
+		this.simulation = null;
+		this.simulationSettled = false;
+		this.graphIsDragging = false;
+		this.graphNodeSelection = null;
+		this.graphLinkSelection = null;
+		this.graphZoomLayer = null;
+		this.graphLinksLayer = null;
+		this.graphNodesLayer = null;
+		this.nodeElementLookup = new Map();
+		this.incidentLinkEnds = new Map();
+		this.boxedNodesLookup = {};
 		d3.select(contentEl).select('svg').remove();
 		this.renderedNodeLookup = new Map();
 	}
 
 	private async rerenderGraph() {
 		this.destroyMapMode();
+		if (this.svg?.node?.()?.isConnected && this.graphNodesLayer && this.graphLinksLayer && this.simulation) {
+			const patched = await this.patchCanvasGraphDisplay();
+			if (patched) {
+				await this.bootstrapControlPlaneOnCanvas(this.svg);
+				return;
+			}
+		}
 		this.clearGraphCanvas();
 		const svg = await this.bootstrapCanvasGraphDisplay();
 		await this.bootstrapControlPlaneOnCanvas(svg);
@@ -831,6 +988,9 @@ class AppContainer {
 	private toggleDiagnosticsVisibility(forceValue?: boolean) {
 		this.diagnosticsVisible = typeof forceValue === 'boolean' ? forceValue : !this.diagnosticsVisible;
 		this.refreshDiagnosticsVisibility();
+		if (this.diagnosticsVisible && this.lastDiagnosticsData) {
+			this.updateDiagnosticsPanel(this.lastDiagnosticsData);
+		}
 	}
 
 	private refreshModeButtons() {
@@ -1007,6 +1167,10 @@ class AppContainer {
 		simulationStatus: string;
 		alpha?: number;
 	}) {
+		this.lastDiagnosticsData = data;
+		if (!this.diagnosticsVisible || this.currentMode !== 'graph') {
+			return;
+		}
 		const panel = this.ensureDiagnosticsPanel();
 		const rows = [
 			['Mode', data.renderMode],
@@ -1022,6 +1186,395 @@ class AppContainer {
 		];
 
 		panel.innerHTML = `<div class="graph-diagnostics-panel__title">Graph diagnostics</div>${rows.map(([k,v]) => `<div class="graph-diagnostics-panel__row"><span>${k}</span><span>${v}</span></div>`).join('')}`;
+	}
+
+	private isCoarsePointerDevice() {
+		return Boolean(this.parentAppContainer?.isMobile)
+			|| (typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches);
+	}
+
+	private getLabelRenderThreshold() {
+		return this.isCoarsePointerDevice() ? this.MOBILE_LABEL_RENDER_THRESHOLD : this.LABEL_RENDER_THRESHOLD;
+	}
+
+	private getImageRenderThreshold() {
+		return this.isCoarsePointerDevice() ? this.MOBILE_IMAGE_RENDER_THRESHOLD : this.IMAGE_RENDER_THRESHOLD;
+	}
+
+	private shouldUseLiteGraphPaint(visibleNodeCount: number) {
+		return this.isCoarsePointerDevice() || visibleNodeCount > 28;
+	}
+
+	private indexIncidentLinks() {
+		const index = new Map<string, Array<{ el: SVGLineElement; end: 'source' | 'target' }>>();
+		this.graphLinkSelection?.each(function (this: SVGLineElement, link: any) {
+			const source = link.source;
+			const target = link.target;
+			const sourceId = typeof source === 'string' ? source : source?.id;
+			const targetId = typeof target === 'string' ? target : target?.id;
+			if (sourceId) {
+				const list = index.get(sourceId) ?? [];
+				list.push({ el: this, end: 'source' });
+				index.set(sourceId, list);
+			}
+			if (targetId) {
+				const list = index.get(targetId) ?? [];
+				list.push({ el: this, end: 'target' });
+				index.set(targetId, list);
+			}
+		});
+		this.incidentLinkEnds = index;
+	}
+
+	private graphDomMatchesVisibleState() {
+		const visibleIds = this.graphState.getDisplayableNodeIds();
+		if (visibleIds.length !== this.renderedNodeLookup.size) {
+			return false;
+		}
+		return visibleIds.every((nodeId) => this.renderedNodeLookup.has(nodeId));
+	}
+
+	private getDirectedLinkKey(link: any): string {
+		const sourceId = typeof link.source === 'object' ? link.source.id : String(link.source ?? '');
+		const targetId = typeof link.target === 'object' ? link.target.id : String(link.target ?? '');
+		return `${sourceId}\0${targetId}\0${link.zIndex ?? ''}`;
+	}
+
+	private collectRenderNodesAndLinks() {
+		const visibleLinks = this.graphState.getVisibleLinks();
+		const previousNodes = this.renderedNodeLookup;
+		const previousLinks = new Map<string, any>();
+		this.graphLinkSelection?.each((link: any) => {
+			previousLinks.set(this.getDirectedLinkKey(link), link);
+		});
+
+		const nodesById = new Map<string, any>();
+		this.graphState.getVisibleNodes().forEach((d: any) => {
+			if (nodesById.has(d.source)) {
+				return;
+			}
+			const prior = previousNodes.get(d.source);
+			if (prior) {
+				prior.image = d.image && d.image !== defaultAvatar ? d.image : (prior.image ?? defaultAvatar);
+				prior.imageCandidates = d.imageCandidates;
+				prior.nodeFilePath = d.nodeFilePath;
+				if (d.fx != null) {
+					prior.fx = d.fx;
+					prior.x = d.fx;
+				}
+				if (d.fy != null) {
+					prior.fy = d.fy;
+					prior.y = d.fy;
+				}
+				nodesById.set(d.source, prior);
+				return;
+			}
+			nodesById.set(d.source, {
+				id: d.source,
+				image: d.image ?? defaultAvatar,
+				imageCandidates: d.imageCandidates,
+				nodeFilePath: d.nodeFilePath,
+				fx: d.fx ?? null,
+				fy: d.fy ?? null,
+				x: d.x,
+				y: d.y,
+				vx: 0,
+				vy: 0,
+				avatarHydrated: Boolean(d.image && d.image !== defaultAvatar),
+			});
+		});
+		const nodes = Array.from(nodesById.values());
+		this.seedUnpinnedNodePositions(nodes);
+		const links = this.uniqueJsonArray(visibleLinks).map((d) => {
+			const key = `${d.source}\0${d.target}\0${d.zIndex ?? ''}`;
+			return previousLinks.get(key) ?? Object.create(d);
+		});
+		return { nodes, links };
+	}
+
+	private async hydrateVisibleAvatars(nodes: any[]) {
+		await Promise.all(nodes.map(async (node) => {
+			if (node.avatarHydrated) {
+				return;
+			}
+			if (node.image && node.image !== defaultAvatar) {
+				node.avatarHydrated = true;
+				return;
+			}
+			const resolved = await this.graphPlugin.resolveAvatar(node.imageCandidates);
+			node.image = resolved;
+			node.avatarHydrated = true;
+			const nodeId = node.id ?? node.source;
+			const graphNode = nodeId ? this.graphState.getNodeById(nodeId) : null;
+			if (graphNode) {
+				graphNode.image = resolved;
+			}
+		}));
+	}
+
+	private scheduleGraphPaint() {
+		if (this.paintRafHandle != null) {
+			return;
+		}
+		this.paintRafHandle = window.requestAnimationFrame(() => {
+			this.paintRafHandle = null;
+			this.paintGraphFrame();
+		});
+	}
+
+	private seedUnpinnedNodePositions(nodes: any[]) {
+		const unpinned = nodes.filter((node: any) => node.fx == null || node.fy == null);
+		if (unpinned.length === 0) {
+			return;
+		}
+		const originId = this.activeNodeToolbeltId ?? this.currentSelectedNodeId;
+		const originNode = originId ? this.graphState.getNodeById(originId) : null;
+		const ox = originNode?.fx ?? originNode?.x ?? SVG_WIDTH / 2;
+		const oy = originNode?.fy ?? originNode?.y ?? SVG_HEIGHT / 2;
+		const radius = Math.max(140, 48 + unpinned.length * 10);
+		unpinned.forEach((node: any, index: number) => {
+			const angle = -Math.PI / 2 + (index * 2 * Math.PI) / Math.max(unpinned.length, 1);
+			const x = ox + Math.cos(angle) * radius;
+			const y = oy + Math.sin(angle) * radius;
+			node.x = x;
+			node.y = y;
+			node.fx = x;
+			node.fy = y;
+			node.vx = 0;
+			node.vy = 0;
+			this.graphState.updateNodeCoordinates(node.id, { fx: x, fy: y });
+		});
+	}
+
+	private pinRenderedNodesInPlace() {
+		this.renderedNodeLookup.forEach((node: any, nodeId: string) => {
+			const x = node.fx ?? node.x;
+			const y = node.fy ?? node.y;
+			if (x == null || y == null) {
+				return;
+			}
+			node.x = x;
+			node.y = y;
+			node.fx = x;
+			node.fy = y;
+			node.vx = 0;
+			node.vy = 0;
+			this.graphState.updateNodeCoordinates(nodeId, { fx: x, fy: y });
+		});
+	}
+
+	private settleSimulation(status: string) {
+		this.simulation?.alphaTarget(0);
+		this.simulation?.stop();
+		this.simulationSettled = true;
+		if (this.simulationAutoStopHandle != null) {
+			window.clearTimeout(this.simulationAutoStopHandle);
+			this.simulationAutoStopHandle = null;
+		}
+		this.paintGraphFrame();
+		this.updateDiagnosticsPanel({
+			visibleNodes: this.renderedVisibleNodeCount,
+			visibleLinks: this.graphLinkSelection?.size?.() ?? this.graphState.getVisibleLinks().length,
+			renderedLabels: this.renderedVisibleNodeCount,
+			renderedImages: this.renderedVisibleNodeCount,
+			selectedNodeId: this.currentSelectedNodeId,
+			rootNodeCount: this.rootNodeIds.length,
+			collapsedNodeCount: this.collapsedNodeIds.length,
+			searchResultCount: this.searchResultNodeIds.length,
+			renderMode: this.liteGraphPaint ? 'lite-static' : 'full-detail',
+			simulationStatus: status,
+			alpha: this.simulation?.alpha?.() ?? 0,
+		});
+	}
+
+	private paintGraphFrame(force = false) {
+		this.renderedNodeLookup.forEach((node: any, nodeId: string) => {
+			const x = Math.round(node.x ?? node.fx ?? 0);
+			const y = Math.round(node.y ?? node.fy ?? 0);
+			if (!force && node._px === x && node._py === y) {
+				return;
+			}
+			node._px = x;
+			node._py = y;
+			const nodeEl = this.nodeElementLookup.get(nodeId);
+			if (nodeEl) {
+				nodeEl.setAttribute('transform', `translate(${x},${y})`);
+			}
+			const incident = this.incidentLinkEnds.get(nodeId);
+			if (!incident) {
+				return;
+			}
+			for (const item of incident) {
+				if (item.end === 'source') {
+					item.el.setAttribute('x1', String(x));
+					item.el.setAttribute('y1', String(y));
+				} else {
+					item.el.setAttribute('x2', String(x));
+					item.el.setAttribute('y2', String(y));
+				}
+			}
+		});
+	}
+
+	private constrainDragPosition(nodeId: string, x: number, y: number) {
+		const box = this.boxedNodesLookup[nodeId];
+		if (!box) {
+			return { x, y };
+		}
+		return {
+			x: Math.max(box.x + RADIUS_NODE, Math.min(x, box.x + box.width - RADIUS_NODE)),
+			y: Math.max(box.y + RADIUS_NODE, Math.min(y, box.y + box.height - RADIUS_NODE)),
+		};
+	}
+
+	private applyKinematicNodeMove(d: any, x: number, y: number) {
+		d.x = x;
+		d.y = y;
+		d.fx = x;
+		d.fy = y;
+		d.vx = 0;
+		d.vy = 0;
+		d._px = Math.round(x);
+		d._py = Math.round(y);
+		this.graphState.updateNodeCoordinates(d.id, { fx: x, fy: y });
+		const nodeEl = this.nodeElementLookup.get(d.id);
+		if (nodeEl) {
+			nodeEl.setAttribute('transform', `translate(${x},${y})`);
+		}
+		const incident = this.incidentLinkEnds.get(d.id);
+		if (incident) {
+			for (const item of incident) {
+				if (item.end === 'source') {
+					item.el.setAttribute('x1', String(x));
+					item.el.setAttribute('y1', String(y));
+				} else {
+					item.el.setAttribute('x2', String(x));
+					item.el.setAttribute('y2', String(y));
+				}
+			}
+		}
+	}
+
+	private setGraphDragging(active: boolean, nodeId?: string) {
+		this.graphIsDragging = active;
+		const svgNode = this.svg?.node?.() as SVGSVGElement | undefined;
+		svgNode?.classList.toggle('ikg-is-dragging', active);
+		this.nodeElementLookup.forEach((element, id) => {
+			element.classList.toggle('is-dragging', Boolean(active && id === nodeId));
+		});
+	}
+
+	private refreshRenderedNodePaints() {
+		this.nodeElementLookup.forEach((element, nodeId) => {
+			const core = element.querySelector('.ikg-node-core') as SVGCircleElement | null;
+			if (!core) {
+				return;
+			}
+			core.setAttribute('fill', this.identifyColorForNodeCircle(
+				nodeId,
+				this.rootNodeIds,
+				this.currentSelectedNodeId,
+				this.searchResultNodeIds,
+			));
+			core.setAttribute('stroke', this.identifyStrokeForNodeCircle(
+				nodeId,
+				this.rootNodeIds,
+				this.currentSelectedNodeId,
+				this.searchResultNodeIds,
+			));
+			core.setAttribute('stroke-width', nodeId === this.currentSelectedNodeId ? '5' : '3');
+			element.classList.toggle('is-selected', nodeId === this.currentSelectedNodeId);
+			element.classList.toggle('is-toolbelt-host', nodeId === this.activeNodeToolbeltId);
+		});
+	}
+
+	private clearRenderedNodeToolbelts() {
+		this.nodeElementLookup.forEach((element) => {
+			element.querySelectorAll('.ikg-node-toolbelt, .ikg-node-toolbelt-aura').forEach((child) => child.remove());
+			element.classList.remove('is-toolbelt-host');
+		});
+	}
+
+	private attachNodeToolbelt(groupEl: SVGGElement, nodeId: string) {
+		const hostSelection = d3.select(groupEl);
+		hostSelection.append('circle')
+			.attr('class', 'ikg-node-toolbelt-aura')
+			.attr('r', RADIUS_NODE + 26)
+			.attr('fill', 'rgba(168, 85, 247, 0.08)')
+			.attr('stroke', 'rgba(244, 114, 182, 0.55)')
+			.attr('stroke-width', 2.5)
+			.style('pointer-events', 'none');
+
+		const host = hostSelection.append('g').attr('class', 'ikg-node-toolbelt');
+		const actions = this.getNodeActionBubbles(nodeId);
+		const bubble = host.selectAll('g')
+			.data(actions)
+			.join('g')
+			.attr('class', 'ikg-node-action-bubble')
+			.attr('transform', (action: any) => {
+				const angle = (action.angle * Math.PI) / 180;
+				const radius = NODE_TOOLBELT_BUBBLE_DISTANCE;
+				return `translate(${Math.cos(angle) * radius},${Math.sin(angle) * radius})`;
+			})
+			.style('cursor', 'pointer')
+			.on('click', (event: any, action: any) => {
+				event.stopPropagation();
+				void this.handleNodeActionBubble(action.key, nodeId);
+			});
+
+		bubble.append('circle')
+			.attr('r', 24)
+			.attr('fill', 'rgba(15, 23, 42, 0.92)')
+			.attr('stroke', 'rgba(191, 219, 254, 0.5)')
+			.attr('stroke-width', 1.8);
+
+		bubble.append('text')
+			.attr('text-anchor', 'middle')
+			.attr('alignment-baseline', 'middle')
+			.attr('fill', '#fff')
+			.attr('font-size', 16)
+			.style('pointer-events', 'none')
+			.text((action: any) => action.emoji);
+
+		bubble.append('text')
+			.attr('y', 38)
+			.attr('text-anchor', 'middle')
+			.attr('fill', 'rgba(241, 245, 249, 0.92)')
+			.attr('font-size', 9)
+			.attr('font-weight', 600)
+			.style('pointer-events', 'none')
+			.text((action: any) => action.label);
+
+		hostSelection.raise();
+		groupEl.classList.add('is-toolbelt-host');
+	}
+
+	private syncSelectionAndToolbelt(nodeId: string | null) {
+		this.clearRenderedNodeToolbelts();
+		this.refreshRenderedNodePaints();
+		if (!nodeId) {
+			return;
+		}
+		const groupEl = this.nodeElementLookup.get(nodeId);
+		if (!groupEl) {
+			return;
+		}
+		this.attachNodeToolbelt(groupEl, nodeId);
+	}
+
+	private async refreshGraphAfterInteraction(nodeId: string, options: { focusNode?: boolean } = {}) {
+		const { focusNode = true } = options;
+		if (this.graphDomMatchesVisibleState() && this.svg) {
+			this.syncSelectionAndToolbelt(this.activeNodeToolbeltId ?? nodeId);
+			if (focusNode) {
+				this.focusOnNode(nodeId);
+			}
+			return;
+		}
+		await this.rerenderGraph();
+		if (focusNode) {
+			this.focusOnNode(nodeId);
+		}
 	}
 
 	// section 1 ---------------------------- Canvas Application UI
@@ -1088,20 +1641,15 @@ class AppContainer {
 
 	private shouldRenderNodeLabel(nodeId: string, visibleNodeCount: number) {
 		return (
-			visibleNodeCount <= this.LABEL_RENDER_THRESHOLD ||
+			visibleNodeCount <= this.getLabelRenderThreshold() ||
 			nodeId === this.currentSelectedNodeId ||
 			this.rootNodeIds.includes(nodeId) ||
 			this.searchResultNodeIds.includes(nodeId)
 		);
 	}
 
-	private shouldRenderNodeImage(nodeId: string, visibleNodeCount: number) {
-		return (
-			visibleNodeCount <= this.IMAGE_RENDER_THRESHOLD ||
-			nodeId === this.currentSelectedNodeId ||
-			this.rootNodeIds.includes(nodeId) ||
-			this.searchResultNodeIds.includes(nodeId)
-		);
+	private shouldRenderNodeImage(_nodeId: string, _visibleNodeCount: number) {
+		return true;
 	}
 
 	private isNodeCollapsed(nodeId: string) {
@@ -1187,8 +1735,7 @@ class AppContainer {
 		if (openNoteOnDesktop && !isMobile && leaves.length > 0) {
 			this.openInNewTabIfTabNotAlreadyOpened(d.nodeFilePath, this.parentAppContainer)
 		}
-		this.graphState.ensureNodeIsRoot(d.id)
-		this.currentSelectedNodeId = d.id
+		this.graphState.setCurrentSelectedNodeId(d.id)
 		void this.bootstrapControlPlaneOnCanvas(this.svg)
 		if (focusNode) {
 			this.focusOnNode(d.id)
@@ -1225,7 +1772,7 @@ class AppContainer {
 				this.suppressNodeClickUntilMs = Date.now() + 240
 				this.activeNodeToolbeltId = d.id
 				this.cancelNodeHold(false)
-				void this.rerenderGraph()
+				void this.refreshGraphAfterInteraction(d.id, { focusNode: false })
 				return
 			}
 			this.holdAnimationFrameHandle = window.requestAnimationFrame(animate)
@@ -1245,24 +1792,19 @@ class AppContainer {
 			return
 		}
 		const shouldExpand = this.pendingSecondTapNodeId === d.id && this.pendingSecondTapExpiryMs > now
-		const toolbeltNeedsMove = this.activeNodeToolbeltId !== d.id
 		this.activeNodeToolbeltId = d.id
-		this.selectNode(d, { openNoteOnDesktop: true, focusNode: true })
+		this.selectNode(d, { openNoteOnDesktop: true, focusNode: false })
 		if (shouldExpand) {
 			this.clearPendingSecondTap(d.id)
 			if (this.canPanelExpand(d.id)) {
 				this.graphState.markNodeManuallyExpanded(d.id)
-				void this.rerenderGraph().then(() => this.focusOnNode(d.id))
-			} else {
-				void this.rerenderGraph().then(() => this.focusOnNode(d.id))
 			}
+			void this.refreshGraphAfterInteraction(d.id, { focusNode: true })
 			return
 		}
 		this.pendingSecondTapNodeId = d.id
 		this.pendingSecondTapExpiryMs = now + NODE_SECOND_TAP_WINDOW_MS
-		if (toolbeltNeedsMove) {
-			void this.rerenderGraph().then(() => this.focusOnNode(d.id))
-		}
+		void this.refreshGraphAfterInteraction(d.id, { focusNode: false })
 	}
 
 	private getNodeActionBubbles(nodeId: string) {
@@ -1787,6 +2329,19 @@ class AppContainer {
 			return !hasLatLng && this.nodeMatchesCurrentSearch(node);
 		});
 		const selectedNode = this.currentSelectedNodeId ? this.graphState.getNodeById(this.currentSelectedNodeId) : null;
+		const mapAvatarNodes: GraphNode[] = [];
+		const seenAvatarIds = new Set<string>();
+		for (const record of locatedRecords) {
+			if (seenAvatarIds.has(record.node.source)) {
+				continue;
+			}
+			seenAvatarIds.add(record.node.source);
+			mapAvatarNodes.push(record.node);
+		}
+		if (selectedNode && !seenAvatarIds.has(selectedNode.source)) {
+			mapAvatarNodes.push(selectedNode);
+		}
+		await this.hydrateVisibleAvatars(mapAvatarNodes);
 		const selectedRecord = this.getSelectedNodeLatestLocatedRecord();
 		const autoFrameRecord = this.mapAutoFrameNodeId
 			? this.getAllLocatedRecords().filter((record) => record.node.source === this.mapAutoFrameNodeId).at(-1) ?? null
@@ -1949,91 +2504,69 @@ class AppContainer {
 				.classed('ikg-graph-svg', true);
 		this.svg = svg
 
-		// Ensure correct scaling
-		const width = SVG_WIDTH;
-		const height = SVG_HEIGHT;
-		const visibleLinks = this.graphState.getVisibleLinks();
-		const links = this.uniqueJsonArray(visibleLinks).map(
-			d => Object.create(d)
-		);
-		const nodesById = new Map<string, any>();
-		const visibleNodes = this.graphState.getVisibleNodes();
-		visibleNodes.forEach((d: any) => {
-			if (!nodesById.has(d.source)) {
-				nodesById.set(d.source, {
-					id: d.source,
-					image: d.image ?? defaultAvatar,
-					nodeFilePath: d.nodeFilePath,
-					fx: d.fx,
-					fy: d.fy,
-					x: d.x,
-					y: d.y,
-					vx: d.vx,
-					vy: d.vy,
-				});
-			}
-		});
-		const nodes = Array.from(nodesById.values());
+		const { nodes, links } = this.collectRenderNodesAndLinks();
+		await this.hydrateVisibleAvatars(nodes);
 
 		const boxedNodes: any = {};
 		const visibleNodeCount = nodes.length;
 		const visibleLinkCount = links.length;
-		const shouldRenderDecorations = visibleNodeCount <= this.DECORATION_RENDER_THRESHOLD;
+		const litePaint = this.shouldUseLiteGraphPaint(visibleNodeCount);
+		const allNodesPinned = nodes.length > 0 && nodes.every((node: any) => node.fx != null && node.fy != null);
+		const shouldRenderDecorations = !litePaint && visibleNodeCount <= this.DECORATION_RENDER_THRESHOLD;
 		const renderedLabelCount = nodes.filter((node: any) => this.shouldRenderNodeLabel(node.id, visibleNodeCount)).length;
 		const renderedImageCount = nodes.filter((node: any) => this.shouldRenderNodeImage(node.id, visibleNodeCount)).length;
-		const renderMode = visibleNodeCount > this.LABEL_RENDER_THRESHOLD ? 'compact-rich' : 'full-detail';
+		const renderMode = litePaint
+			? 'lite-paint'
+			: visibleNodeCount > this.getLabelRenderThreshold() ? 'compact-rich' : 'full-detail';
+		svg.classed('ikg-lite-paint', litePaint);
+		this.liteGraphPaint = litePaint;
+		this.renderedVisibleNodeCount = visibleNodeCount;
+		this.simulationSettled = false;
 
 		box_encapsulations.forEach(box => {
 			box.Nodes.forEach((nodeId: string) => {
 				boxedNodes[nodeId] = box;
 			});
 		});
+		this.boxedNodesLookup = boxedNodes;
 
-		// Define the custom force to keep nodes within their assigned boxes
-		function boxConstraintForce(boxedNodesDataset: any[]) {
-			return function(alpha: any) {
+		function boxConstraintForce(boxedNodesDataset: any) {
+			return function(_alpha: any) {
 				nodes.forEach(node => {
 					const box = boxedNodesDataset[node.id];
 					if (box) {
-						// Check if the node is within its assigned box, and adjust if needed
-						let minX = box.x
-						let minY = box.y
-						let maxX = box.x + box.width
-						let maxY = box.y + box.height
-						node.x = Math.max(minX + RADIUS_NODE, Math.min(node.x, maxX - RADIUS_NODE));
-						node.y = Math.max(minY + RADIUS_NODE, Math.min(node.y, maxY - RADIUS_NODE));
+						node.x = Math.max(box.x + RADIUS_NODE, Math.min(node.x, box.x + box.width - RADIUS_NODE));
+						node.y = Math.max(box.y + RADIUS_NODE, Math.min(node.y, box.y + box.height - RADIUS_NODE));
 					}
 				});
 			};
 		}
 
-		// Add the custom box constraint force to the simulation configuration
+		const chargeForce = d3.forceManyBody()
+			.strength(visibleNodeCount > 40 ? -90 : -220)
+			.theta(litePaint ? 0.95 : 0.9)
+			.distanceMax(litePaint ? 280 : 420);
+		const collideForce = d3.forceCollide()
+			.radius((node: any) => this.getNodeCollisionRadius(node.id, visibleNodeCount))
+			.strength(1)
+			.iterations(litePaint ? 1 : 2);
+
 		// bookmark__Simulation Configuration
 		const simulation = d3.forceSimulation(nodes)
-			.force('link', 
+			.force('link',
 				d3.forceLink(links)
-				.distance((link: any) => {
-					const sourceId = typeof link.source === 'string' ? link.source : link.source?.id;
-					const targetId = typeof link.target === 'string' ? link.target : link.target?.id;
-					const touchesToolbeltNode = sourceId === this.activeNodeToolbeltId || targetId === this.activeNodeToolbeltId;
-					if (touchesToolbeltNode) {
-						return visibleNodeCount > 40 ? 135 : 175;
-					}
-					return visibleNodeCount > 40 ? 75 : 100;
-				})
-				.id((d: any) => {
-					return d.id;
-				})
+				.distance(() => visibleNodeCount > 40 ? 75 : 100)
+				.id((d: any) => d.id)
 				.strength(0.1)
 			)
-			// .force('center', d3.forceCenter(width / 2, height / 2)) // this is reason why nodes keep popping far away
-			.force('charge', d3.forceManyBody().strength(visibleNodeCount > 40 ? -120 : -220))
-			.force("collide", d3.forceCollide()
-				.radius((node: any) => this.getNodeCollisionRadius(node.id, visibleNodeCount))
-				.strength(1)
-				.iterations(2))
-			.force("boxConstraint", boxConstraintForce(boxedNodes));
-		simulation.alphaDecay(visibleNodeCount > 40 ? 0.3 : 0.2);
+			.force('charge', chargeForce)
+			.force('collide', collideForce);
+		if (Object.keys(boxedNodes).length > 0) {
+			simulation.force('boxConstraint', boxConstraintForce(boxedNodes));
+		}
+		simulation.alphaDecay(litePaint || visibleNodeCount > 40 ? 0.4 : 0.2);
+		simulation.velocityDecay(litePaint ? 0.55 : 0.4);
+		simulation.stop();
 		this.simulation = simulation;
 		this.renderedNodeLookup = new Map(nodes.map((node: any) => [node.id, node]));
 		this.updateDiagnosticsPanel({
@@ -2046,13 +2579,20 @@ class AppContainer {
 			collapsedNodeCount: this.collapsedNodeIds.length,
 			searchResultCount: this.searchResultNodeIds.length,
 			renderMode,
-			simulationStatus: 'starting',
+			simulationStatus: allNodesPinned ? 'pinned-static' : 'starting',
 			alpha: simulation.alpha(),
 		});
 
 		// bookmark__Add Custom-Shape-definitions: Arrow-Marks, etc
-		svg.append('defs')
-			.append('marker')
+		const svgDefs = svg.append('defs');
+		svgDefs.append('clipPath')
+			.attr('id', 'ikg-avatar-clip')
+			.attr('clipPathUnits', 'userSpaceOnUse')
+			.append('circle')
+			.attr('cx', 0)
+			.attr('cy', 0)
+			.attr('r', NODE_IMAGE_SIZE / 2);
+		svgDefs.append('marker')
 			.attr('id', 'arrowhead')
 			.attr('markerWidth', 40)
 			.attr('markerHeight', 40)
@@ -2063,9 +2603,7 @@ class AppContainer {
 			.append('polygon')
 			.attr('points', '0 0, 40 20, 0 40')
 			.attr('fill', 'black');
-		// Define an arrow marker for the end of each axis
-		svg.append('defs')
-			.append('marker')
+		svgDefs.append('marker')
 			.attr('id', 'arrow')
 			.attr('viewBox', '0 0 10 10')
 			.attr('refX', 5)
@@ -2103,18 +2641,20 @@ class AppContainer {
 			this.cancelNodeHold()
 			if (this.activeNodeToolbeltId) {
 				this.activeNodeToolbeltId = null
-				void this.rerenderGraph()
+				this.syncSelectionAndToolbelt(null)
 			}
 		})
 
-		// bookmark__Render Relationship-Link On UI
-		const link = zoomableGraphContainer.append('g')
+		this.graphZoomLayer = zoomableGraphContainer
+		this.graphLinksLayer = zoomableGraphContainer.append('g')
+			.attr('class', 'ikg-link-layer')
 			.attr('stroke', 'rgba(149, 193, 255, 0.72)')
 			.attr('stroke-opacity', 0.9)
 			.attr('stroke-width', visibleNodeCount > 40 ? 1.5 : 2.4)
-			.attr('marker-end', "url(#arrowhead)")
+			.attr('marker-end', "url(#arrowhead)");
+		const link = this.graphLinksLayer
 			.selectAll('line')
-			.data(links)
+			.data(links, (d: any) => this.getDirectedLinkKey(d))
 			.join('line');
 
 		// bookmark__Render_rectangles_groupping_nodes
@@ -2188,6 +2728,8 @@ class AppContainer {
 		}
 		
 		if (shouldRenderDecorations) {
+			const width = SVG_WIDTH;
+			const height = SVG_HEIGHT;
 			// Draw the Oy axis line (vertical)
 			zoomableGraphContainer.append('line')
 				.attr('x1', 0)
@@ -2212,195 +2754,43 @@ class AppContainer {
 
 
 		// bookmark__Render Node-Ball On UI
-		const node = zoomableGraphContainer.append('g')
+		this.graphNodesLayer = zoomableGraphContainer.append('g')
+			.attr('class', 'ikg-node-layer')
 			.attr('stroke', '#fff')
-			.attr('stroke-width', 1.5)
-			.selectAll('g')
-			.data(nodes)
-			.join('g')
-			.attr('class', 'ikg-node-group')
-			.attr('data-box', d => boxedNodes[d.id] ? boxedNodes[d.id].Id : null)
-			// @ts-ignore
-			.call(dragNodeHandler(simulation, this.graphState, () => this.cancelNodeHold()))
-			.on('pointerdown', (event: any, d: any) => {
-				event.stopPropagation()
-				this.beginNodeHold(event, d, event.currentTarget as SVGGElement)
-			})
-			.on('pointerup', () => this.cancelNodeHold())
-			.on('pointerleave', () => this.cancelNodeHold())
-			.on('pointercancel', () => this.cancelNodeHold())
-			.on('click', (event: any, d: any) => this.handleNodePrimaryTap(event, d));
-
-		node.append('circle')
-			.attr('class', 'ikg-node-hold-ring')
-			.attr('r', RADIUS_NODE + 16)
-			.attr('fill', 'none')
-			.attr('stroke', 'rgba(244, 114, 182, 0.95)')
-			.attr('stroke-width', 6)
-			.attr('stroke-linecap', 'round')
-			.attr('transform', 'rotate(-90)')
-			.style('opacity', 0)
-			.style('display', 'none')
-			.style('pointer-events', 'none');
-
-		node.filter((d: { id: string }) => this.activeNodeToolbeltId === d.id)
-			.append('circle')
-			.attr('class', 'ikg-node-toolbelt-aura')
-			.attr('r', RADIUS_NODE + 26)
-			.attr('fill', 'rgba(168, 85, 247, 0.08)')
-			.attr('stroke', 'rgba(244, 114, 182, 0.55)')
-			.attr('stroke-width', 2.5)
-			.style('pointer-events', 'none');
-
-		node.append('circle')
-			.attr('r', RADIUS_NODE)
-			.attr('stroke', (d: { id: any; }) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds))
-			.attr('stroke-width', (d: { id: any; }) => d.id === this.currentSelectedNodeId ? 5 : 3)
-			.attr('filter', 'drop-shadow(0 14px 26px rgba(15, 23, 42, 0.28))')
-			.attr('fill', (d: { id: any; }) =>
-				this.identifyColorForNodeCircle(
-					d.id,
-					this.rootNodeIds,
-					this.currentSelectedNodeId,
-					this.searchResultNodeIds)
-			);
-
-		// Append rectangles below the circles
-		node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
-			.append('rect')
-			.attr('width', WIDTH_NODE_TITLE_BAR + 36)
-			.attr('height', HEIGHT_NODE_TITLE_BAR + 8)
-			.attr('rx', 16)
-			.attr('ry', 16)
-			.attr('x', -(WIDTH_NODE_TITLE_BAR + 28) / 2)
-			.attr('y', RADIUS_NODE + 10)
-			.attr('fill', 'rgba(15, 23, 42, 0.64)')
-			.attr('stroke', 'rgba(191, 219, 254, 0.16)')
-			.attr('stroke-width', 1);
-
-		// bookmark__Node Render Face Image (first image within note file)
-		node.filter((d: { id: string; }) => this.shouldRenderNodeImage(d.id, visibleNodeCount))
-			.append('image')
-			.attr('clip-path', 'circle(40px at center)')
-			.attr('xlink:href', (d: { image: any; }) => d.image ?? defaultAvatar)
-			.attr('x', -NODE_IMAGE_SIZE / 2)
-			.attr('y', -NODE_IMAGE_SIZE / 2)
-			.attr('width', NODE_IMAGE_SIZE)
-			.attr('height', NODE_IMAGE_SIZE)
-			.style('pointer-events', 'none');
-
-		// Append text within the rectangles
-		node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
-			.append('text')
-			.attr('x', 0)
-			.attr('y', RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10)
-			.attr('text-anchor', 'middle')
-			.attr('alignment-baseline', 'middle')
-			.attr('fill', 'rgba(248, 250, 252, 0.96)')
-			.attr('stroke', 'rgba(15, 23, 42, 0.92)')
-			.attr('stroke-width', 0.75)
-			.attr('paint-order', 'stroke')
-			.attr('font-size', visibleNodeCount > 80 ? 9 : 10.5)
-			.attr('font-weight', 450)
-			.attr('letter-spacing', '0')
-			.style('font-family', 'var(--font-interface)')
-			.style('text-rendering', 'geometricPrecision')
-			.style('shape-rendering', 'geometricPrecision')
-			.style('-webkit-font-smoothing', 'antialiased')
-			.text((d: { id: any; }) => d.id.length > 18 ? `${d.id.slice(0, 18)}…` : d.id);
-
-		node.append('circle')
-			.attr('cx', -RADIUS_NODE * 0.68)
-			.attr('cy', -RADIUS_NODE * 0.68)
-			.attr('r', 14)
-			.attr('fill', (d: { id: string; }) => this.canNodeExpand(d.id) ? 'rgba(34,197,94,0.95)' : this.canNodeCollapse(d.id) ? 'rgba(245,158,11,0.95)' : 'rgba(100,116,139,0.82)')
-			.attr('stroke', 'rgba(255,255,255,0.85)')
 			.attr('stroke-width', 1.5);
+		const node = this.bindNodeSelection(
+			this.graphNodesLayer
+				.selectAll('g.ikg-node-group')
+				.data(nodes, (d: any) => d.id)
+				.join('g'),
+			simulation,
+			boxedNodes,
+			visibleNodeCount,
+			litePaint,
+			true,
+		);
 
-		node.append('text')
-			.attr('x', -RADIUS_NODE * 0.68)
-			.attr('y', -RADIUS_NODE * 0.68 + 0.5)
-			.attr('text-anchor', 'middle')
-			.attr('alignment-baseline', 'middle')
-			.attr('fill', '#fff')
-			.attr('font-size', 13)
-			.attr('font-weight', 700)
-			.style('pointer-events', 'none')
-			.style('font-family', 'var(--font-interface)')
-			.style('text-rendering', 'geometricPrecision')
-			.text((d: { id: string; }) => this.canNodeExpand(d.id) ? '+' : this.canNodeCollapse(d.id) ? '–' : '•');
+		this.graphNodeSelection = node;
+		this.graphLinkSelection = link;
+		this.captureGraphElementLookups(node);
+		this.indexIncidentLinks();
+		this.paintGraphFrame(true);
 
-		// Append text count-relationships within the rectangle
-		node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
-			.append('text')
-			.attr('x', RADIUS_NODE * 0.8)
-			.attr('y', -RADIUS_NODE)
-			.attr('text-anchor', 'middle')
-			.attr('text-color', 'purple')
-			.attr('alignment-baseline', 'middle')
-			.attr('fill', 'rgba(147, 197, 253, 0.88)')
-			.attr('font-size', 10)
-			.attr('font-weight', 600)
-			.text(
-				(d: { id: any; }) => `${this.graphState.getNodeNeighborCount(d.id)}`);
-
-		node.filter((d: { id: string }) => this.activeNodeToolbeltId === d.id)
-			.each((d: any, index: number, groups: any) => {
-				const host = d3.select(groups[index]).append('g').attr('class', 'ikg-node-toolbelt');
-				const actions = this.getNodeActionBubbles(d.id);
-				const bubble = host.selectAll('g')
-					.data(actions)
-					.join('g')
-					.attr('class', 'ikg-node-action-bubble')
-					.attr('transform', (action: any) => {
-						const angle = (action.angle * Math.PI) / 180;
-						const radius = NODE_TOOLBELT_BUBBLE_DISTANCE;
-						return `translate(${Math.cos(angle) * radius},${Math.sin(angle) * radius})`;
-					})
-					.style('cursor', 'pointer')
-					.on('click', (event: any, action: any) => {
-						event.stopPropagation()
-						void this.handleNodeActionBubble(action.key, d.id)
-					});
-
-				bubble.append('circle')
-					.attr('r', 24)
-					.attr('fill', 'rgba(15, 23, 42, 0.92)')
-					.attr('stroke', 'rgba(191, 219, 254, 0.5)')
-					.attr('stroke-width', 1.8)
-					.attr('filter', 'drop-shadow(0 10px 18px rgba(15, 23, 42, 0.32))');
-
-				bubble.append('text')
-					.attr('text-anchor', 'middle')
-					.attr('alignment-baseline', 'middle')
-					.attr('fill', '#fff')
-					.attr('font-size', 16)
-					.style('pointer-events', 'none')
-					.text((action: any) => action.emoji);
-
-				bubble.append('text')
-					.attr('y', 38)
-					.attr('text-anchor', 'middle')
-					.attr('fill', 'rgba(241, 245, 249, 0.92)')
-					.attr('font-size', 9)
-					.attr('font-weight', 600)
-					.style('pointer-events', 'none')
-					.text((action: any) => action.label);
-			});
-
+		if (this.activeNodeToolbeltId) {
+			const toolbeltHost = this.nodeElementLookup.get(this.activeNodeToolbeltId);
+			if (toolbeltHost) {
+				this.attachNodeToolbelt(toolbeltHost, this.activeNodeToolbeltId);
+			}
+		}
 
 		let lastDiagnosticsUpdate = 0;
 		simulation.on('tick', () => {
-			link
-				.attr('x1', (d: { source: { x: any; }; }) => d.source.x)
-				.attr('y1', (d: { source: { y: any; }; }) => d.source.y)
-				.attr('x2', (d: { target: { x: any; }; }) => d.target.x)
-				.attr('y2', (d: { target: { y: any; }; }) => d.target.y);
-			//@ts-ignore
-			node.attr('transform', (d: { x: any; y: any; }) => `translate(${Math.round(d.x ?? 0)},${Math.round(d.y ?? 0)})`);
-
+			this.scheduleGraphPaint();
+			if (!this.diagnosticsVisible) {
+				return;
+			}
 			const now = Date.now();
-			if (now - lastDiagnosticsUpdate > 200) {
+			if (now - lastDiagnosticsUpdate > 400) {
 				lastDiagnosticsUpdate = now;
 				this.updateDiagnosticsPanel({
 					visibleNodes: visibleNodeCount,
@@ -2419,6 +2809,11 @@ class AppContainer {
 		});
 
 		simulation.on('end', () => {
+			if (this.simulation !== simulation) {
+				return;
+			}
+			this.pinRenderedNodesInPlace();
+			this.settleSimulation('settled');
 			this.updateDiagnosticsPanel({
 				visibleNodes: visibleNodeCount,
 				visibleLinks: visibleLinkCount,
@@ -2434,10 +2829,19 @@ class AppContainer {
 			});
 		});
 
-		window.setTimeout(() => {
-			if (this.simulation === simulation) {
-				simulation.alphaTarget(0);
-				simulation.stop();
+		if (allNodesPinned) {
+			simulation.stop();
+			simulation.tick();
+			this.pinRenderedNodesInPlace();
+			this.settleSimulation('pinned-static');
+		} else {
+			simulation.alpha(1).restart();
+			this.simulationAutoStopHandle = window.setTimeout(() => {
+				if (this.simulation !== simulation) {
+					return;
+				}
+				this.pinRenderedNodesInPlace();
+				this.settleSimulation('auto-stopped');
 				this.updateDiagnosticsPanel({
 					visibleNodes: visibleNodeCount,
 					visibleLinks: visibleLinkCount,
@@ -2451,104 +2855,305 @@ class AppContainer {
 					simulationStatus: 'auto-stopped',
 					alpha: simulation.alpha(),
 				});
-			}
-		}, visibleNodeCount > 40 ? 1200 : 2200);
-
-
-		// bookmark__Node Drag Handler
-		function dragNodeHandler(simulation: any, graphStateRef: GraphState, onDragStart: () => void) {
-			function updateNodePosition(nodeId: string, fx: number, fy: number) {
-				const node = graphStateRef.getNodeById(nodeId);
-				if (node) {
-					node.fx = fx;
-					node.fy = fy;
-				}
-				graphStateRef.updateNodeCoordinates(nodeId, { fx, fy });
-			}
-
-			function dragstarted(event: any, d: any) {
-				onDragStart()
-				if (!event.active) {
-					simulation.alphaTarget(0.3).restart();
-				}
-
-				const box = boxedNodes[d.id];
-				let selectedX = 0
-				let selectedY = 0
-				if (box) {
-					// Constrain x and y based on the box boundaries
-					const minX = box.x;
-					const maxX = box.x + box.width;
-					const minY = box.y;
-					const maxY = box.y + box.height;
-					
-					selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-					selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-				} else {
-					// If node is not in a box, allow free movement
-					selectedX = event.x;
-					selectedY = event.y;
-				}
-				d.fx = selectedX
-				d.fy = selectedY
-				updateNodePosition(d.id, selectedX, selectedY)
-
-			}
-			function dragged(event: any, d: any) {
-				const box = boxedNodes[d.id];
-				let selectedX = 0
-				let selectedY = 0
-				if (box) {
-					// Constrain x and y based on the box boundaries
-					const minX = box.x;
-					const maxX = box.x + box.width;
-					const minY = box.y;
-					const maxY = box.y + box.height;
-					
-					selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-					selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-				} else {
-					// If node is not in a box, allow free movement
-					selectedX = event.x;
-					selectedY = event.y;
-				}
-
-				d.fx = selectedX;
-				d.fy = selectedY;
-				updateNodePosition(d.id, selectedX, selectedY)
-			}
-			function dragended(event: any, d: any) {
-				if (!event.active) simulation.alphaTarget(0);
-
-				let selectedX = 0
-				let selectedY = 0
-				const box = boxedNodes[d.id];
-				if (box) {
-					// Constrain x and y based on the box boundaries
-					const minX = box.x;
-					const maxX = box.x + box.width;
-					const minY = box.y;
-					const maxY = box.y + box.height;
-					
-					selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-					selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-				} else {
-					// If node is not in a box, allow free movement
-					selectedX = event.x;
-					selectedY = event.y;
-				}
-
-				d.fx = selectedX;
-				d.fy = selectedY;
-				updateNodePosition(d.id, selectedX, selectedY)
-			}
-			return d3.drag()
-				.on('start', dragstarted)
-				.on('drag', dragged)
-				.on('end', dragended);
+			}, litePaint ? 800 : (visibleNodeCount > 40 ? 1200 : 2200));
 		}
 
 		return svg;
+	}
+
+	private bindNodeSelection(
+		selection: any,
+		simulation: any,
+		boxedNodes: any,
+		visibleNodeCount: number,
+		litePaint: boolean,
+		decorateAll: boolean
+	) {
+		selection
+			.attr('class', (d: { id: string }) => `ikg-node-group${d.id === this.currentSelectedNodeId ? ' is-selected' : ''}${d.id === this.activeNodeToolbeltId ? ' is-toolbelt-host' : ''}`)
+			.attr('data-box', (d: { id: string }) => boxedNodes[d.id] ? boxedNodes[d.id].Id : null)
+			.attr('data-node-id', (d: { id: string }) => d.id)
+			// @ts-ignore
+			.call(this.createNodeDragHandler(simulation))
+			.on('pointerdown', (event: any, d: any) => {
+				event.stopPropagation();
+				this.beginNodeHold(event, d, event.currentTarget as SVGGElement);
+			})
+			.on('pointerup', () => this.cancelNodeHold())
+			.on('pointerleave', () => this.cancelNodeHold())
+			.on('pointercancel', () => this.cancelNodeHold())
+			.on('click', (event: any, d: any) => this.handleNodePrimaryTap(event, d));
+
+		if (decorateAll) {
+			this.decorateGraphNodeSelection(selection, visibleNodeCount, litePaint);
+		}
+		return selection;
+	}
+
+	private decorateGraphNodeSelection(selection: any, visibleNodeCount: number, litePaint: boolean) {
+		selection.append('circle')
+			.attr('class', 'ikg-node-hold-ring')
+			.attr('r', RADIUS_NODE + 16)
+			.attr('fill', 'none')
+			.attr('stroke', 'rgba(244, 114, 182, 0.95)')
+			.attr('stroke-width', 6)
+			.attr('stroke-linecap', 'round')
+			.attr('transform', 'rotate(-90)')
+			.style('opacity', 0)
+			.style('display', 'none')
+			.style('pointer-events', 'none');
+
+		selection.append('circle')
+			.attr('class', 'ikg-node-core')
+			.attr('r', RADIUS_NODE)
+			.attr('stroke', (d: { id: any; }) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds))
+			.attr('stroke-width', (d: { id: any; }) => d.id === this.currentSelectedNodeId ? 5 : 3)
+			.attr('fill', (d: { id: any; }) =>
+				this.identifyColorForNodeCircle(
+					d.id,
+					this.rootNodeIds,
+					this.currentSelectedNodeId,
+					this.searchResultNodeIds)
+			);
+
+		selection.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
+			.append('rect')
+			.attr('class', 'ikg-node-label-bg')
+			.attr('width', WIDTH_NODE_TITLE_BAR + 36)
+			.attr('height', HEIGHT_NODE_TITLE_BAR + 8)
+			.attr('rx', 16)
+			.attr('ry', 16)
+			.attr('x', -(WIDTH_NODE_TITLE_BAR + 28) / 2)
+			.attr('y', RADIUS_NODE + 10)
+			.attr('fill', 'rgba(15, 23, 42, 0.64)')
+			.attr('stroke', 'rgba(191, 219, 254, 0.16)')
+			.attr('stroke-width', 1)
+			.style('pointer-events', 'none');
+
+		selection.append('image')
+			.attr('class', 'ikg-node-avatar')
+			.attr('clip-path', 'url(#ikg-avatar-clip)')
+			.attr('href', (d: { image: any; }) => d.image ?? defaultAvatar)
+			.attr('xlink:href', (d: { image: any; }) => d.image ?? defaultAvatar)
+			.attr('x', -NODE_IMAGE_SIZE / 2)
+			.attr('y', -NODE_IMAGE_SIZE / 2)
+			.attr('width', NODE_IMAGE_SIZE)
+			.attr('height', NODE_IMAGE_SIZE)
+			.attr('preserveAspectRatio', 'xMidYMid slice')
+			.style('pointer-events', 'none');
+
+		const labelText = selection.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
+			.append('text')
+			.attr('class', 'ikg-node-label')
+			.attr('x', 0)
+			.attr('y', RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10)
+			.attr('text-anchor', 'middle')
+			.attr('alignment-baseline', 'middle')
+			.attr('fill', 'rgba(248, 250, 252, 0.96)')
+			.attr('stroke', 'rgba(15, 23, 42, 0.92)')
+			.attr('stroke-width', 0.75)
+			.attr('paint-order', 'stroke')
+			.attr('font-size', visibleNodeCount > 80 ? 9 : 10.5)
+			.attr('font-weight', 450)
+			.style('font-family', 'var(--font-interface)')
+			.style('pointer-events', 'none')
+			.text((d: { id: any; }) => d.id.length > 18 ? `${d.id.slice(0, 18)}…` : d.id);
+		if (!litePaint) {
+			labelText
+				.style('text-rendering', 'geometricPrecision')
+				.style('shape-rendering', 'geometricPrecision')
+				.style('-webkit-font-smoothing', 'antialiased');
+		}
+
+		selection.append('circle')
+			.attr('class', 'ikg-node-badge')
+			.attr('cx', -RADIUS_NODE * 0.68)
+			.attr('cy', -RADIUS_NODE * 0.68)
+			.attr('r', 14)
+			.attr('fill', (d: { id: string; }) => this.canNodeExpand(d.id) ? 'rgba(34,197,94,0.95)' : this.canNodeCollapse(d.id) ? 'rgba(245,158,11,0.95)' : 'rgba(100,116,139,0.82)')
+			.attr('stroke', 'rgba(255,255,255,0.85)')
+			.attr('stroke-width', 1.5);
+
+		selection.append('text')
+			.attr('class', 'ikg-node-badge-label')
+			.attr('x', -RADIUS_NODE * 0.68)
+			.attr('y', -RADIUS_NODE * 0.68 + 0.5)
+			.attr('text-anchor', 'middle')
+			.attr('alignment-baseline', 'middle')
+			.attr('fill', '#fff')
+			.attr('font-size', 13)
+			.attr('font-weight', 700)
+			.style('pointer-events', 'none')
+			.style('font-family', 'var(--font-interface)')
+			.text((d: { id: string; }) => this.canNodeExpand(d.id) ? '+' : this.canNodeCollapse(d.id) ? '–' : '•');
+
+		selection.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
+			.append('text')
+			.attr('class', 'ikg-node-neighbor-count')
+			.attr('x', RADIUS_NODE * 0.8)
+			.attr('y', -RADIUS_NODE)
+			.attr('text-anchor', 'middle')
+			.attr('alignment-baseline', 'middle')
+			.attr('fill', 'rgba(147, 197, 253, 0.88)')
+			.attr('font-size', 10)
+			.attr('font-weight', 600)
+			.style('pointer-events', 'none')
+			.text((d: { id: any; }) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+	}
+
+	private syncGraphNodeChrome(selection: any, visibleNodeCount: number) {
+		selection
+			.attr('class', (d: { id: string }) => `ikg-node-group${d.id === this.currentSelectedNodeId ? ' is-selected' : ''}${d.id === this.activeNodeToolbeltId ? ' is-toolbelt-host' : ''}`)
+			.attr('data-node-id', (d: { id: string }) => d.id);
+		selection.select('.ikg-node-core')
+			.attr('stroke', (d: { id: any; }) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds))
+			.attr('stroke-width', (d: { id: any; }) => d.id === this.currentSelectedNodeId ? 5 : 3)
+			.attr('fill', (d: { id: any; }) =>
+				this.identifyColorForNodeCircle(
+					d.id,
+					this.rootNodeIds,
+					this.currentSelectedNodeId,
+					this.searchResultNodeIds)
+			);
+		selection.select('.ikg-node-avatar')
+			.attr('href', (d: { image: any; }) => d.image ?? defaultAvatar)
+			.attr('xlink:href', (d: { image: any; }) => d.image ?? defaultAvatar);
+		selection.select('.ikg-node-badge')
+			.attr('fill', (d: { id: string; }) => this.canNodeExpand(d.id) ? 'rgba(34,197,94,0.95)' : this.canNodeCollapse(d.id) ? 'rgba(245,158,11,0.95)' : 'rgba(100,116,139,0.82)');
+		selection.select('.ikg-node-badge-label')
+			.text((d: { id: string; }) => this.canNodeExpand(d.id) ? '+' : this.canNodeCollapse(d.id) ? '–' : '•');
+		selection.select('.ikg-node-neighbor-count')
+			.text((d: { id: any; }) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+		void visibleNodeCount;
+	}
+
+	private captureGraphElementLookups(nodeSelection: any): void {
+		this.nodeElementLookup = new Map();
+		nodeSelection.each((d: { id: string }, index: number, groups: ArrayLike<SVGGElement>) => {
+			this.nodeElementLookup.set(d.id, groups[index]);
+		});
+	}
+
+	private async patchCanvasGraphDisplay(): Promise<boolean> {
+		if (!this.svg || !this.graphZoomLayer || !this.graphLinksLayer || !this.graphNodesLayer || !this.simulation) {
+			return false;
+		}
+		if (!this.svg.node()?.isConnected || !this.graphNodesLayer.node()?.isConnected) {
+			return false;
+		}
+
+		const { nodes, links } = this.collectRenderNodesAndLinks();
+		if (nodes.length === 0) {
+			return false;
+		}
+
+		const visibleNodeCount = nodes.length;
+		const visibleLinkCount = links.length;
+		const litePaint = this.shouldUseLiteGraphPaint(visibleNodeCount);
+		if (litePaint !== this.liteGraphPaint) {
+			return false;
+		}
+
+		await this.hydrateVisibleAvatars(nodes);
+
+		const boxedNodes: any = {};
+		box_encapsulations.forEach(box => {
+			box.Nodes.forEach((nodeId: string) => {
+				boxedNodes[nodeId] = box;
+			});
+		});
+		this.boxedNodesLookup = boxedNodes;
+		this.renderedVisibleNodeCount = visibleNodeCount;
+		this.liteGraphPaint = litePaint;
+		this.svg.classed('ikg-lite-paint', litePaint);
+
+		this.graphLinksLayer
+			.attr('stroke-width', visibleNodeCount > 40 ? 1.5 : 2.4);
+		const linkJoin = this.graphLinksLayer
+			.selectAll('line')
+			.data(links, (d: any) => this.getDirectedLinkKey(d));
+		linkJoin.exit().remove();
+		linkJoin.enter().append('line');
+		this.graphLinkSelection = this.graphLinksLayer.selectAll('line');
+
+		const nodeJoin = this.graphNodesLayer
+			.selectAll('g.ikg-node-group')
+			.data(nodes, (d: any) => d.id);
+		nodeJoin.exit().remove();
+		const nodeEnter = nodeJoin.enter()
+			.append('g')
+			.attr('class', 'ikg-node-group');
+		this.bindNodeSelection(nodeEnter, this.simulation, boxedNodes, visibleNodeCount, litePaint, true);
+		this.graphNodeSelection = nodeEnter.merge(nodeJoin);
+		this.syncGraphNodeChrome(this.graphNodeSelection, visibleNodeCount);
+
+		this.captureGraphElementLookups(this.graphNodeSelection);
+		this.indexIncidentLinks();
+		this.renderedNodeLookup = new Map(nodes.map((node: any) => [node.id, node]));
+
+		this.simulation.nodes(nodes);
+		const linkForce = this.simulation.force('link');
+		linkForce?.links?.(links);
+		const collideForce = this.simulation.force('collide');
+		collideForce?.radius?.((node: any) => this.getNodeCollisionRadius(node.id, visibleNodeCount));
+		this.simulation.stop();
+		this.simulationSettled = true;
+
+		if (this.activeNodeToolbeltId && !this.nodeElementLookup.has(this.activeNodeToolbeltId)) {
+			this.activeNodeToolbeltId = this.currentSelectedNodeId;
+		}
+		if (this.activeNodeToolbeltId) {
+			this.syncSelectionAndToolbelt(this.activeNodeToolbeltId);
+		} else {
+			this.refreshRenderedNodePaints();
+		}
+
+		this.paintGraphFrame(true);
+		const allNodesPinned = nodes.every((node: any) => node.fx != null && node.fy != null);
+		this.updateDiagnosticsPanel({
+			visibleNodes: visibleNodeCount,
+			visibleLinks: visibleLinkCount,
+			renderedLabels: nodes.filter((node: any) => this.shouldRenderNodeLabel(node.id, visibleNodeCount)).length,
+			renderedImages: nodes.filter((node: any) => this.shouldRenderNodeImage(node.id, visibleNodeCount)).length,
+			selectedNodeId: this.currentSelectedNodeId,
+			rootNodeCount: this.rootNodeIds.length,
+			collapsedNodeCount: this.collapsedNodeIds.length,
+			searchResultCount: this.searchResultNodeIds.length,
+			renderMode: litePaint
+				? 'lite-static'
+				: visibleNodeCount > this.getLabelRenderThreshold() ? 'compact-rich' : 'full-detail',
+			simulationStatus: allNodesPinned ? 'patched-static' : 'patched',
+			alpha: this.simulation.alpha?.() ?? 0,
+		});
+		return true;
+	}
+
+	private createNodeDragHandler(simulation: any) {
+		const applyDragPosition = (event: any, d: any) => {
+			const next = this.constrainDragPosition(d.id, event.x, event.y);
+			this.applyKinematicNodeMove(d, next.x, next.y);
+		};
+
+		return d3.drag()
+			.clickDistance(12)
+			.on('start', (event: any, d: any) => {
+				this.cancelNodeHold();
+				this.setGraphDragging(true, d.id);
+				applyDragPosition(event, d);
+				if (!this.simulationSettled && !event.active) {
+					simulation.alphaTarget(0.18).restart();
+				}
+			})
+			.on('drag', (event: any, d: any) => {
+				applyDragPosition(event, d);
+			})
+			.on('end', (event: any, d: any) => {
+				applyDragPosition(event, d);
+				this.setGraphDragging(false);
+				if (!this.simulationSettled && !event.active) {
+					simulation.alphaTarget(0);
+				}
+			});
 	}
 
 	// section 2 ---------------------------- Graph Nodes/Links Renders and Behaviors
@@ -2560,8 +3165,11 @@ class AppContainer {
 		if (nodeData && this.svg && this.zoomBehavior) {
 			const x = nodeData.fx ?? nodeData.x;
 			const y = nodeData.fy ?? nodeData.y;
-			
-			this.svg.transition().duration(300).call(
+			if (x == null || y == null) {
+				return;
+			}
+			const duration = this.isCoarsePointerDevice() ? 0 : 180;
+			this.svg.transition().duration(duration).call(
 				this.zoomBehavior.transform,
 				d3.zoomIdentity
 					.translate(width / 2, height / 2)
@@ -2694,9 +3302,18 @@ class AppContainer {
 
 	// section 4 ---------------------------- Tools and Utils
 	uniqueJsonArray(arr: any[]) {
-		const uniqueSet = new Set(arr.map(obj => JSON.stringify(obj)));
-		return Array.from(uniqueSet).map(str => JSON.parse(str));
-	};
+		const seen = new Set<string>();
+		const unique: any[] = [];
+		for (const obj of arr) {
+			const key = `${obj?.source ?? ''}\0${obj?.target ?? ''}\0${obj?.zIndex ?? ''}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			unique.push(obj);
+		}
+		return unique;
+	}
 
 
 	// section 4 ---------------------------- Tools and Utils

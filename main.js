@@ -13780,9 +13780,6 @@ var GraphState = class {
   }
   setCurrentSelectedNodeId(nodeId) {
     this.currentSelectedNodeId = nodeId;
-    if (nodeId) {
-      this.rootNodeIds.add(nodeId);
-    }
     this.recomputeVisibility();
   }
   ensureNodeIsRoot(nodeId) {
@@ -13915,12 +13912,16 @@ var GraphState = class {
   }
   recomputeVisibility() {
     var _a;
+    const expansionSourceIds = new Set(this.rootNodeIds);
+    this.manuallyExpandedNodeIds.forEach((nodeId) => expansionSourceIds.add(nodeId));
     const initialDisplayable = [];
-    this.rootNodeIds.forEach((root2) => initialDisplayable.push(root2));
+    expansionSourceIds.forEach((nodeId) => initialDisplayable.push(nodeId));
     if (this.currentSelectedNodeId) {
       initialDisplayable.push(this.currentSelectedNodeId);
     }
-    this.activeExpansionNodeIds = new Set(initialDisplayable);
+    this.activeExpansionNodeIds = new Set(
+      Array.from(expansionSourceIds).filter((nodeId) => !this.collapsedNodeIds.has(nodeId))
+    );
     let connectedNodes = [...initialDisplayable];
     const anchorNode = this.getAnchorNodeId();
     if (anchorNode) {
@@ -13944,7 +13945,7 @@ var GraphState = class {
         }
       }
     }
-    for (const nodeId of initialDisplayable) {
+    for (const nodeId of expansionSourceIds) {
       if (this.collapsedNodeIds.has(nodeId)) {
         continue;
       }
@@ -14031,6 +14032,7 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
     super(...arguments);
     this.parsedFileCache = /* @__PURE__ */ new Map();
     this.imageBase64Cache = /* @__PURE__ */ new Map();
+    this.imageBase64Inflight = /* @__PURE__ */ new Map();
   }
   async onload() {
     await this.installSyncedPluginUpdate();
@@ -14086,20 +14088,21 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
         rootNodeIds.add(currentSelectedNodeId);
       } catch (err) {
       }
-      for (const file of files) {
-        const parsed = await this.parseMarkdownFile(file);
+      const parsedFiles = await Promise.all(files.map((file) => this.parseMarkdownFile(file)));
+      for (const parsed of parsedFiles) {
         if (parsed.isRootNode) {
           rootNodeIds.add(parsed.source);
         }
         nodesData.push({
           source: parsed.source,
-          nodeFilePath: file.path,
+          nodeFilePath: parsed.nodeFilePath,
           tags: parsed.tags,
           description: parsed.content,
           mapPositions: parsed.mapPositions,
           fx: (_b = (_a = parsed.persistedCoordinates) == null ? void 0 : _a.fx) != null ? _b : null,
           fy: (_d = (_c = parsed.persistedCoordinates) == null ? void 0 : _c.fy) != null ? _d : null,
-          image: parsed.image
+          image: defaultAvatar,
+          imageCandidates: parsed.imageCandidates
         });
         parsed.backlinks.forEach((link) => {
           if (InteractiveGraphPlugin.isMediaNode(link.target)) {
@@ -14114,6 +14117,7 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
       }
       const displayPanel = new canvas_panel_display_default(this.app, graphLeafBelow);
       const container = new AppContainer(
+        this,
         this.app,
         activeLeaf,
         graphLeafBelow,
@@ -14142,25 +14146,33 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
     const parsed = {
       content,
       source: InteractiveGraphPlugin.cleanNodeFileTextName(file.path),
+      nodeFilePath: file.path,
       isRootNode: content.includes("#ROOT_NODE"),
       backlinks: this.parseBacklinks(content),
       tags: this.extractTags(content, file.path),
       mapPositions: this.extractMapPositions(content),
       persistedCoordinates: this.extractFxFy(content),
-      image: await this.extractFirstImage(content)
+      imageCandidates: this.extractFirstImageCandidates(content)
     };
     this.parsedFileCache.set(cacheKey, { mtime: fileMtime, data: parsed });
     return parsed;
   }
   // bookmark__InteractiveGraphPlugin random Static-utilities
-  async extractFirstImage(content) {
+  extractFirstImageCandidates(content) {
+    var _a;
     const imageRegex = /!\[\[([^\]]+)\]\]/g;
     const match = imageRegex.exec(content);
     if (!match) {
-      return defaultAvatar;
+      return [];
     }
-    const imagePath = match[1];
-    for (const candidatePath of [`images/${imagePath}`, imagePath]) {
+    const imagePath = (_a = match[1].split("|")[0]) == null ? void 0 : _a.trim();
+    if (!imagePath) {
+      return [];
+    }
+    return [`images/${imagePath}`, imagePath];
+  }
+  async extractFirstImage(content) {
+    for (const candidatePath of this.extractFirstImageCandidates(content)) {
       try {
         return await this.imageToBase64(candidatePath);
       } catch (err) {
@@ -14216,16 +14228,102 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
     }
     return window.btoa(binary);
   }
+  async resolveAvatar(imageCandidates) {
+    if (!imageCandidates || imageCandidates.length === 0) {
+      return defaultAvatar;
+    }
+    for (const candidatePath of imageCandidates) {
+      try {
+        return await this.imageToBase64(candidatePath);
+      } catch (_error) {
+        continue;
+      }
+    }
+    return defaultAvatar;
+  }
   async imageToBase64(relativePath) {
-    const cached = this.imageBase64Cache.get(relativePath);
+    const cacheKey = `${relativePath}@avatar`;
+    const cached = this.imageBase64Cache.get(cacheKey);
+    if (cached === "") {
+      throw new Error(`Avatar miss: ${relativePath}`);
+    }
     if (cached) {
       return cached;
     }
-    const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
-    const base64 = InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer);
-    const dataUri = `data:image/png;base64,${base64}`;
-    this.imageBase64Cache.set(relativePath, dataUri);
-    return dataUri;
+    const inflight = this.imageBase64Inflight.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+    const task = this.decodeAvatarToCache(relativePath, cacheKey);
+    this.imageBase64Inflight.set(cacheKey, task);
+    try {
+      return await task;
+    } finally {
+      this.imageBase64Inflight.delete(cacheKey);
+    }
+  }
+  async decodeAvatarToCache(relativePath, cacheKey) {
+    try {
+      const arrayBuffer = await this.app.vault.adapter.readBinary(relativePath);
+      const resized = await this.resizeImageToAvatarDataUri(arrayBuffer);
+      const dataUri = resized != null ? resized : `data:image/png;base64,${InteractiveGraphPlugin.arrayBufferToBase64(arrayBuffer)}`;
+      this.imageBase64Cache.set(cacheKey, dataUri);
+      this.imageBase64Cache.set(relativePath, dataUri);
+      return dataUri;
+    } catch (error) {
+      this.imageBase64Cache.set(cacheKey, "");
+      throw error;
+    }
+  }
+  drawSquareCoverToCanvas(source, sourceWidth, sourceHeight, size) {
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+    const minSide = Math.min(sourceWidth, sourceHeight) || size;
+    const sx = Math.max(0, (sourceWidth - minSide) / 2);
+    const sy = Math.max(0, (sourceHeight - minSide) / 2);
+    ctx.drawImage(source, sx, sy, minSide, minSide, 0, 0, size, size);
+    return canvas.toDataURL("image/jpeg", 0.7);
+  }
+  async resizeImageToAvatarDataUri(arrayBuffer) {
+    var _a;
+    const size = Math.round(NODE_IMAGE_SIZE * 2);
+    const blob = new Blob([arrayBuffer]);
+    try {
+      if (typeof createImageBitmap === "function") {
+        const bitmap = await createImageBitmap(blob);
+        const uri = this.drawSquareCoverToCanvas(bitmap, bitmap.width, bitmap.height, size);
+        (_a = bitmap.close) == null ? void 0 : _a.call(bitmap);
+        if (uri) {
+          return uri;
+        }
+      }
+    } catch (error) {
+      console.warn("Avatar bitmap resize failed, trying Image fallback", error);
+    }
+    return await new Promise((resolve) => {
+      const objectUrl = URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => {
+        try {
+          resolve(this.drawSquareCoverToCanvas(image, image.naturalWidth, image.naturalHeight, size));
+        } catch (error) {
+          console.warn("Avatar canvas resize failed", error);
+          resolve(null);
+        } finally {
+          URL.revokeObjectURL(objectUrl);
+        }
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve(null);
+      };
+      image.src = objectUrl;
+    });
   }
   parseBacklinks(content) {
     const regex = /\[\[([^\]]+)\],\s*(\d+)\]|\[\[([^\]]+)\]\]/g;
@@ -14343,7 +14441,7 @@ var InteractiveGraphPlugin = class extends import_obsidian2.Plugin {
   }
 };
 var AppContainer = class {
-  constructor(parentAppContainer, userTextEditorPanel, graphContainerPanel, displayPanelComponent, linksData, nodesData, rootNodeIds, currentSelectedNodeId) {
+  constructor(graphPlugin, parentAppContainer, userTextEditorPanel, graphContainerPanel, displayPanelComponent, linksData, nodesData, rootNodeIds, currentSelectedNodeId) {
     // D3-Transformer-Zoom Object
     this.currentTransform = identity2;
     this.diagnosticsPanelEl = null;
@@ -14392,11 +14490,29 @@ var AppContainer = class {
     this.mapSectionExpanded = {};
     this.layoutObserver = null;
     this.layoutSyncFrameHandle = null;
+    this.graphNodeSelection = null;
+    this.graphLinkSelection = null;
+    this.graphZoomLayer = null;
+    this.graphLinksLayer = null;
+    this.graphNodesLayer = null;
+    this.nodeElementLookup = /* @__PURE__ */ new Map();
+    this.incidentLinkEnds = /* @__PURE__ */ new Map();
+    this.boxedNodesLookup = {};
+    this.simulationSettled = false;
+    this.simulationAutoStopHandle = null;
+    this.paintRafHandle = null;
+    this.graphIsDragging = false;
+    this.renderedVisibleNodeCount = 0;
+    this.liteGraphPaint = false;
+    this.lastDiagnosticsData = null;
     this.LABEL_RENDER_THRESHOLD = 120;
     this.IMAGE_RENDER_THRESHOLD = 90;
     this.DECORATION_RENDER_THRESHOLD = 50;
+    this.MOBILE_LABEL_RENDER_THRESHOLD = 64;
+    this.MOBILE_IMAGE_RENDER_THRESHOLD = 36;
     this.linksData = linksData;
     this.nodesData = nodesData;
+    this.graphPlugin = graphPlugin;
     this.graphState = new GraphState({
       nodes: nodesData,
       links: linksData,
@@ -14544,12 +14660,39 @@ var AppContainer = class {
   clearGraphCanvas() {
     var _a;
     const contentEl = this.graphContainerPanel.view.containerEl;
+    if (this.simulationAutoStopHandle != null) {
+      window.clearTimeout(this.simulationAutoStopHandle);
+      this.simulationAutoStopHandle = null;
+    }
+    if (this.paintRafHandle != null) {
+      window.cancelAnimationFrame(this.paintRafHandle);
+      this.paintRafHandle = null;
+    }
     (_a = this.simulation) == null ? void 0 : _a.stop();
+    this.simulation = null;
+    this.simulationSettled = false;
+    this.graphIsDragging = false;
+    this.graphNodeSelection = null;
+    this.graphLinkSelection = null;
+    this.graphZoomLayer = null;
+    this.graphLinksLayer = null;
+    this.graphNodesLayer = null;
+    this.nodeElementLookup = /* @__PURE__ */ new Map();
+    this.incidentLinkEnds = /* @__PURE__ */ new Map();
+    this.boxedNodesLookup = {};
     select_default2(contentEl).select("svg").remove();
     this.renderedNodeLookup = /* @__PURE__ */ new Map();
   }
   async rerenderGraph() {
+    var _a, _b, _c;
     this.destroyMapMode();
+    if (((_c = (_b = (_a = this.svg) == null ? void 0 : _a.node) == null ? void 0 : _b.call(_a)) == null ? void 0 : _c.isConnected) && this.graphNodesLayer && this.graphLinksLayer && this.simulation) {
+      const patched = await this.patchCanvasGraphDisplay();
+      if (patched) {
+        await this.bootstrapControlPlaneOnCanvas(this.svg);
+        return;
+      }
+    }
     this.clearGraphCanvas();
     const svg = await this.bootstrapCanvasGraphDisplay();
     await this.bootstrapControlPlaneOnCanvas(svg);
@@ -14586,6 +14729,9 @@ var AppContainer = class {
   toggleDiagnosticsVisibility(forceValue) {
     this.diagnosticsVisible = typeof forceValue === "boolean" ? forceValue : !this.diagnosticsVisible;
     this.refreshDiagnosticsVisibility();
+    if (this.diagnosticsVisible && this.lastDiagnosticsData) {
+      this.updateDiagnosticsPanel(this.lastDiagnosticsData);
+    }
   }
   refreshModeButtons() {
     var _a, _b;
@@ -14735,6 +14881,10 @@ var AppContainer = class {
   }
   updateDiagnosticsPanel(data) {
     var _a;
+    this.lastDiagnosticsData = data;
+    if (!this.diagnosticsVisible || this.currentMode !== "graph") {
+      return;
+    }
     const panel = this.ensureDiagnosticsPanel();
     const rows = [
       ["Mode", data.renderMode],
@@ -14749,6 +14899,351 @@ var AppContainer = class {
       ["Simulation", data.alpha != null ? `${data.simulationStatus} (\u03B1=${data.alpha.toFixed(3)})` : data.simulationStatus]
     ];
     panel.innerHTML = `<div class="graph-diagnostics-panel__title">Graph diagnostics</div>${rows.map(([k, v]) => `<div class="graph-diagnostics-panel__row"><span>${k}</span><span>${v}</span></div>`).join("")}`;
+  }
+  isCoarsePointerDevice() {
+    var _a, _b;
+    return Boolean((_a = this.parentAppContainer) == null ? void 0 : _a.isMobile) || typeof window !== "undefined" && ((_b = window.matchMedia) == null ? void 0 : _b.call(window, "(pointer: coarse)").matches);
+  }
+  getLabelRenderThreshold() {
+    return this.isCoarsePointerDevice() ? this.MOBILE_LABEL_RENDER_THRESHOLD : this.LABEL_RENDER_THRESHOLD;
+  }
+  getImageRenderThreshold() {
+    return this.isCoarsePointerDevice() ? this.MOBILE_IMAGE_RENDER_THRESHOLD : this.IMAGE_RENDER_THRESHOLD;
+  }
+  shouldUseLiteGraphPaint(visibleNodeCount) {
+    return this.isCoarsePointerDevice() || visibleNodeCount > 28;
+  }
+  indexIncidentLinks() {
+    var _a;
+    const index2 = /* @__PURE__ */ new Map();
+    (_a = this.graphLinkSelection) == null ? void 0 : _a.each(function(link) {
+      var _a2, _b;
+      const source = link.source;
+      const target = link.target;
+      const sourceId = typeof source === "string" ? source : source == null ? void 0 : source.id;
+      const targetId = typeof target === "string" ? target : target == null ? void 0 : target.id;
+      if (sourceId) {
+        const list = (_a2 = index2.get(sourceId)) != null ? _a2 : [];
+        list.push({ el: this, end: "source" });
+        index2.set(sourceId, list);
+      }
+      if (targetId) {
+        const list = (_b = index2.get(targetId)) != null ? _b : [];
+        list.push({ el: this, end: "target" });
+        index2.set(targetId, list);
+      }
+    });
+    this.incidentLinkEnds = index2;
+  }
+  graphDomMatchesVisibleState() {
+    const visibleIds = this.graphState.getDisplayableNodeIds();
+    if (visibleIds.length !== this.renderedNodeLookup.size) {
+      return false;
+    }
+    return visibleIds.every((nodeId) => this.renderedNodeLookup.has(nodeId));
+  }
+  getDirectedLinkKey(link) {
+    var _a, _b, _c;
+    const sourceId = typeof link.source === "object" ? link.source.id : String((_a = link.source) != null ? _a : "");
+    const targetId = typeof link.target === "object" ? link.target.id : String((_b = link.target) != null ? _b : "");
+    return `${sourceId}\0${targetId}\0${(_c = link.zIndex) != null ? _c : ""}`;
+  }
+  collectRenderNodesAndLinks() {
+    var _a;
+    const visibleLinks = this.graphState.getVisibleLinks();
+    const previousNodes = this.renderedNodeLookup;
+    const previousLinks = /* @__PURE__ */ new Map();
+    (_a = this.graphLinkSelection) == null ? void 0 : _a.each((link) => {
+      previousLinks.set(this.getDirectedLinkKey(link), link);
+    });
+    const nodesById = /* @__PURE__ */ new Map();
+    this.graphState.getVisibleNodes().forEach((d) => {
+      var _a2, _b, _c, _d;
+      if (nodesById.has(d.source)) {
+        return;
+      }
+      const prior = previousNodes.get(d.source);
+      if (prior) {
+        prior.image = d.image && d.image !== defaultAvatar ? d.image : (_a2 = prior.image) != null ? _a2 : defaultAvatar;
+        prior.imageCandidates = d.imageCandidates;
+        prior.nodeFilePath = d.nodeFilePath;
+        if (d.fx != null) {
+          prior.fx = d.fx;
+          prior.x = d.fx;
+        }
+        if (d.fy != null) {
+          prior.fy = d.fy;
+          prior.y = d.fy;
+        }
+        nodesById.set(d.source, prior);
+        return;
+      }
+      nodesById.set(d.source, {
+        id: d.source,
+        image: (_b = d.image) != null ? _b : defaultAvatar,
+        imageCandidates: d.imageCandidates,
+        nodeFilePath: d.nodeFilePath,
+        fx: (_c = d.fx) != null ? _c : null,
+        fy: (_d = d.fy) != null ? _d : null,
+        x: d.x,
+        y: d.y,
+        vx: 0,
+        vy: 0,
+        avatarHydrated: Boolean(d.image && d.image !== defaultAvatar)
+      });
+    });
+    const nodes = Array.from(nodesById.values());
+    this.seedUnpinnedNodePositions(nodes);
+    const links = this.uniqueJsonArray(visibleLinks).map((d) => {
+      var _a2, _b;
+      const key = `${d.source}\0${d.target}\0${(_a2 = d.zIndex) != null ? _a2 : ""}`;
+      return (_b = previousLinks.get(key)) != null ? _b : Object.create(d);
+    });
+    return { nodes, links };
+  }
+  async hydrateVisibleAvatars(nodes) {
+    await Promise.all(nodes.map(async (node) => {
+      var _a;
+      if (node.avatarHydrated) {
+        return;
+      }
+      if (node.image && node.image !== defaultAvatar) {
+        node.avatarHydrated = true;
+        return;
+      }
+      const resolved = await this.graphPlugin.resolveAvatar(node.imageCandidates);
+      node.image = resolved;
+      node.avatarHydrated = true;
+      const nodeId = (_a = node.id) != null ? _a : node.source;
+      const graphNode = nodeId ? this.graphState.getNodeById(nodeId) : null;
+      if (graphNode) {
+        graphNode.image = resolved;
+      }
+    }));
+  }
+  scheduleGraphPaint() {
+    if (this.paintRafHandle != null) {
+      return;
+    }
+    this.paintRafHandle = window.requestAnimationFrame(() => {
+      this.paintRafHandle = null;
+      this.paintGraphFrame();
+    });
+  }
+  seedUnpinnedNodePositions(nodes) {
+    var _a, _b, _c, _d, _e;
+    const unpinned = nodes.filter((node) => node.fx == null || node.fy == null);
+    if (unpinned.length === 0) {
+      return;
+    }
+    const originId = (_a = this.activeNodeToolbeltId) != null ? _a : this.currentSelectedNodeId;
+    const originNode = originId ? this.graphState.getNodeById(originId) : null;
+    const ox = (_c = (_b = originNode == null ? void 0 : originNode.fx) != null ? _b : originNode == null ? void 0 : originNode.x) != null ? _c : SVG_WIDTH / 2;
+    const oy = (_e = (_d = originNode == null ? void 0 : originNode.fy) != null ? _d : originNode == null ? void 0 : originNode.y) != null ? _e : SVG_HEIGHT / 2;
+    const radius = Math.max(140, 48 + unpinned.length * 10);
+    unpinned.forEach((node, index2) => {
+      const angle = -Math.PI / 2 + index2 * 2 * Math.PI / Math.max(unpinned.length, 1);
+      const x3 = ox + Math.cos(angle) * radius;
+      const y3 = oy + Math.sin(angle) * radius;
+      node.x = x3;
+      node.y = y3;
+      node.fx = x3;
+      node.fy = y3;
+      node.vx = 0;
+      node.vy = 0;
+      this.graphState.updateNodeCoordinates(node.id, { fx: x3, fy: y3 });
+    });
+  }
+  pinRenderedNodesInPlace() {
+    this.renderedNodeLookup.forEach((node, nodeId) => {
+      var _a, _b;
+      const x3 = (_a = node.fx) != null ? _a : node.x;
+      const y3 = (_b = node.fy) != null ? _b : node.y;
+      if (x3 == null || y3 == null) {
+        return;
+      }
+      node.x = x3;
+      node.y = y3;
+      node.fx = x3;
+      node.fy = y3;
+      node.vx = 0;
+      node.vy = 0;
+      this.graphState.updateNodeCoordinates(nodeId, { fx: x3, fy: y3 });
+    });
+  }
+  settleSimulation(status) {
+    var _a, _b, _c, _d, _e, _f, _g, _h;
+    (_a = this.simulation) == null ? void 0 : _a.alphaTarget(0);
+    (_b = this.simulation) == null ? void 0 : _b.stop();
+    this.simulationSettled = true;
+    if (this.simulationAutoStopHandle != null) {
+      window.clearTimeout(this.simulationAutoStopHandle);
+      this.simulationAutoStopHandle = null;
+    }
+    this.paintGraphFrame();
+    this.updateDiagnosticsPanel({
+      visibleNodes: this.renderedVisibleNodeCount,
+      visibleLinks: (_e = (_d = (_c = this.graphLinkSelection) == null ? void 0 : _c.size) == null ? void 0 : _d.call(_c)) != null ? _e : this.graphState.getVisibleLinks().length,
+      renderedLabels: this.renderedVisibleNodeCount,
+      renderedImages: this.renderedVisibleNodeCount,
+      selectedNodeId: this.currentSelectedNodeId,
+      rootNodeCount: this.rootNodeIds.length,
+      collapsedNodeCount: this.collapsedNodeIds.length,
+      searchResultCount: this.searchResultNodeIds.length,
+      renderMode: this.liteGraphPaint ? "lite-static" : "full-detail",
+      simulationStatus: status,
+      alpha: (_h = (_g = (_f = this.simulation) == null ? void 0 : _f.alpha) == null ? void 0 : _g.call(_f)) != null ? _h : 0
+    });
+  }
+  paintGraphFrame(force = false) {
+    this.renderedNodeLookup.forEach((node, nodeId) => {
+      var _a, _b, _c, _d;
+      const x3 = Math.round((_b = (_a = node.x) != null ? _a : node.fx) != null ? _b : 0);
+      const y3 = Math.round((_d = (_c = node.y) != null ? _c : node.fy) != null ? _d : 0);
+      if (!force && node._px === x3 && node._py === y3) {
+        return;
+      }
+      node._px = x3;
+      node._py = y3;
+      const nodeEl = this.nodeElementLookup.get(nodeId);
+      if (nodeEl) {
+        nodeEl.setAttribute("transform", `translate(${x3},${y3})`);
+      }
+      const incident = this.incidentLinkEnds.get(nodeId);
+      if (!incident) {
+        return;
+      }
+      for (const item of incident) {
+        if (item.end === "source") {
+          item.el.setAttribute("x1", String(x3));
+          item.el.setAttribute("y1", String(y3));
+        } else {
+          item.el.setAttribute("x2", String(x3));
+          item.el.setAttribute("y2", String(y3));
+        }
+      }
+    });
+  }
+  constrainDragPosition(nodeId, x3, y3) {
+    const box = this.boxedNodesLookup[nodeId];
+    if (!box) {
+      return { x: x3, y: y3 };
+    }
+    return {
+      x: Math.max(box.x + RADIUS_NODE, Math.min(x3, box.x + box.width - RADIUS_NODE)),
+      y: Math.max(box.y + RADIUS_NODE, Math.min(y3, box.y + box.height - RADIUS_NODE))
+    };
+  }
+  applyKinematicNodeMove(d, x3, y3) {
+    d.x = x3;
+    d.y = y3;
+    d.fx = x3;
+    d.fy = y3;
+    d.vx = 0;
+    d.vy = 0;
+    d._px = Math.round(x3);
+    d._py = Math.round(y3);
+    this.graphState.updateNodeCoordinates(d.id, { fx: x3, fy: y3 });
+    const nodeEl = this.nodeElementLookup.get(d.id);
+    if (nodeEl) {
+      nodeEl.setAttribute("transform", `translate(${x3},${y3})`);
+    }
+    const incident = this.incidentLinkEnds.get(d.id);
+    if (incident) {
+      for (const item of incident) {
+        if (item.end === "source") {
+          item.el.setAttribute("x1", String(x3));
+          item.el.setAttribute("y1", String(y3));
+        } else {
+          item.el.setAttribute("x2", String(x3));
+          item.el.setAttribute("y2", String(y3));
+        }
+      }
+    }
+  }
+  setGraphDragging(active, nodeId) {
+    var _a, _b;
+    this.graphIsDragging = active;
+    const svgNode2 = (_b = (_a = this.svg) == null ? void 0 : _a.node) == null ? void 0 : _b.call(_a);
+    svgNode2 == null ? void 0 : svgNode2.classList.toggle("ikg-is-dragging", active);
+    this.nodeElementLookup.forEach((element, id2) => {
+      element.classList.toggle("is-dragging", Boolean(active && id2 === nodeId));
+    });
+  }
+  refreshRenderedNodePaints() {
+    this.nodeElementLookup.forEach((element, nodeId) => {
+      const core = element.querySelector(".ikg-node-core");
+      if (!core) {
+        return;
+      }
+      core.setAttribute("fill", this.identifyColorForNodeCircle(
+        nodeId,
+        this.rootNodeIds,
+        this.currentSelectedNodeId,
+        this.searchResultNodeIds
+      ));
+      core.setAttribute("stroke", this.identifyStrokeForNodeCircle(
+        nodeId,
+        this.rootNodeIds,
+        this.currentSelectedNodeId,
+        this.searchResultNodeIds
+      ));
+      core.setAttribute("stroke-width", nodeId === this.currentSelectedNodeId ? "5" : "3");
+      element.classList.toggle("is-selected", nodeId === this.currentSelectedNodeId);
+      element.classList.toggle("is-toolbelt-host", nodeId === this.activeNodeToolbeltId);
+    });
+  }
+  clearRenderedNodeToolbelts() {
+    this.nodeElementLookup.forEach((element) => {
+      element.querySelectorAll(".ikg-node-toolbelt, .ikg-node-toolbelt-aura").forEach((child) => child.remove());
+      element.classList.remove("is-toolbelt-host");
+    });
+  }
+  attachNodeToolbelt(groupEl, nodeId) {
+    const hostSelection = select_default2(groupEl);
+    hostSelection.append("circle").attr("class", "ikg-node-toolbelt-aura").attr("r", RADIUS_NODE + 26).attr("fill", "rgba(168, 85, 247, 0.08)").attr("stroke", "rgba(244, 114, 182, 0.55)").attr("stroke-width", 2.5).style("pointer-events", "none");
+    const host = hostSelection.append("g").attr("class", "ikg-node-toolbelt");
+    const actions = this.getNodeActionBubbles(nodeId);
+    const bubble = host.selectAll("g").data(actions).join("g").attr("class", "ikg-node-action-bubble").attr("transform", (action) => {
+      const angle = action.angle * Math.PI / 180;
+      const radius = NODE_TOOLBELT_BUBBLE_DISTANCE;
+      return `translate(${Math.cos(angle) * radius},${Math.sin(angle) * radius})`;
+    }).style("cursor", "pointer").on("click", (event, action) => {
+      event.stopPropagation();
+      void this.handleNodeActionBubble(action.key, nodeId);
+    });
+    bubble.append("circle").attr("r", 24).attr("fill", "rgba(15, 23, 42, 0.92)").attr("stroke", "rgba(191, 219, 254, 0.5)").attr("stroke-width", 1.8);
+    bubble.append("text").attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", 16).style("pointer-events", "none").text((action) => action.emoji);
+    bubble.append("text").attr("y", 38).attr("text-anchor", "middle").attr("fill", "rgba(241, 245, 249, 0.92)").attr("font-size", 9).attr("font-weight", 600).style("pointer-events", "none").text((action) => action.label);
+    hostSelection.raise();
+    groupEl.classList.add("is-toolbelt-host");
+  }
+  syncSelectionAndToolbelt(nodeId) {
+    this.clearRenderedNodeToolbelts();
+    this.refreshRenderedNodePaints();
+    if (!nodeId) {
+      return;
+    }
+    const groupEl = this.nodeElementLookup.get(nodeId);
+    if (!groupEl) {
+      return;
+    }
+    this.attachNodeToolbelt(groupEl, nodeId);
+  }
+  async refreshGraphAfterInteraction(nodeId, options = {}) {
+    var _a;
+    const { focusNode = true } = options;
+    if (this.graphDomMatchesVisibleState() && this.svg) {
+      this.syncSelectionAndToolbelt((_a = this.activeNodeToolbeltId) != null ? _a : nodeId);
+      if (focusNode) {
+        this.focusOnNode(nodeId);
+      }
+      return;
+    }
+    await this.rerenderGraph();
+    if (focusNode) {
+      this.focusOnNode(nodeId);
+    }
   }
   // section 1 ---------------------------- Canvas Application UI
   async onOpen() {
@@ -14809,10 +15304,10 @@ var AppContainer = class {
     }
   }
   shouldRenderNodeLabel(nodeId, visibleNodeCount) {
-    return visibleNodeCount <= this.LABEL_RENDER_THRESHOLD || nodeId === this.currentSelectedNodeId || this.rootNodeIds.includes(nodeId) || this.searchResultNodeIds.includes(nodeId);
+    return visibleNodeCount <= this.getLabelRenderThreshold() || nodeId === this.currentSelectedNodeId || this.rootNodeIds.includes(nodeId) || this.searchResultNodeIds.includes(nodeId);
   }
-  shouldRenderNodeImage(nodeId, visibleNodeCount) {
-    return visibleNodeCount <= this.IMAGE_RENDER_THRESHOLD || nodeId === this.currentSelectedNodeId || this.rootNodeIds.includes(nodeId) || this.searchResultNodeIds.includes(nodeId);
+  shouldRenderNodeImage(_nodeId, _visibleNodeCount) {
+    return true;
   }
   isNodeCollapsed(nodeId) {
     return this.graphState.isNodeCollapsed(nodeId);
@@ -14884,8 +15379,7 @@ var AppContainer = class {
     if (openNoteOnDesktop && !isMobile && leaves.length > 0) {
       this.openInNewTabIfTabNotAlreadyOpened(d.nodeFilePath, this.parentAppContainer);
     }
-    this.graphState.ensureNodeIsRoot(d.id);
-    this.currentSelectedNodeId = d.id;
+    this.graphState.setCurrentSelectedNodeId(d.id);
     void this.bootstrapControlPlaneOnCanvas(this.svg);
     if (focusNode) {
       this.focusOnNode(d.id);
@@ -14920,7 +15414,7 @@ var AppContainer = class {
         this.suppressNodeClickUntilMs = Date.now() + 240;
         this.activeNodeToolbeltId = d.id;
         this.cancelNodeHold(false);
-        void this.rerenderGraph();
+        void this.refreshGraphAfterInteraction(d.id, { focusNode: false });
         return;
       }
       this.holdAnimationFrameHandle = window.requestAnimationFrame(animate);
@@ -14938,24 +15432,19 @@ var AppContainer = class {
       return;
     }
     const shouldExpand = this.pendingSecondTapNodeId === d.id && this.pendingSecondTapExpiryMs > now2;
-    const toolbeltNeedsMove = this.activeNodeToolbeltId !== d.id;
     this.activeNodeToolbeltId = d.id;
-    this.selectNode(d, { openNoteOnDesktop: true, focusNode: true });
+    this.selectNode(d, { openNoteOnDesktop: true, focusNode: false });
     if (shouldExpand) {
       this.clearPendingSecondTap(d.id);
       if (this.canPanelExpand(d.id)) {
         this.graphState.markNodeManuallyExpanded(d.id);
-        void this.rerenderGraph().then(() => this.focusOnNode(d.id));
-      } else {
-        void this.rerenderGraph().then(() => this.focusOnNode(d.id));
       }
+      void this.refreshGraphAfterInteraction(d.id, { focusNode: true });
       return;
     }
     this.pendingSecondTapNodeId = d.id;
     this.pendingSecondTapExpiryMs = now2 + NODE_SECOND_TAP_WINDOW_MS;
-    if (toolbeltNeedsMove) {
-      void this.rerenderGraph().then(() => this.focusOnNode(d.id));
-    }
+    void this.refreshGraphAfterInteraction(d.id, { focusNode: false });
   }
   getNodeActionBubbles(nodeId) {
     return [
@@ -15451,6 +15940,19 @@ var AppContainer = class {
       return !hasLatLng && this.nodeMatchesCurrentSearch(node);
     });
     const selectedNode = this.currentSelectedNodeId ? this.graphState.getNodeById(this.currentSelectedNodeId) : null;
+    const mapAvatarNodes = [];
+    const seenAvatarIds = /* @__PURE__ */ new Set();
+    for (const record of locatedRecords) {
+      if (seenAvatarIds.has(record.node.source)) {
+        continue;
+      }
+      seenAvatarIds.add(record.node.source);
+      mapAvatarNodes.push(record.node);
+    }
+    if (selectedNode && !seenAvatarIds.has(selectedNode.source)) {
+      mapAvatarNodes.push(selectedNode);
+    }
+    await this.hydrateVisibleAvatars(mapAvatarNodes);
     const selectedRecord = this.getSelectedNodeLatestLocatedRecord();
     const autoFrameRecord = this.mapAutoFrameNodeId ? (_a = this.getAllLocatedRecords().filter((record) => record.node.source === this.mapAutoFrameNodeId).at(-1)) != null ? _a : null : selectedRecord;
     this.mapSelectionTitleEl.setText((_b = selectedNode == null ? void 0 : selectedNode.source) != null ? _b : "Pick a node");
@@ -15580,74 +16082,50 @@ var AppContainer = class {
     const contentEl = this.graphContainerPanel.view.containerEl;
     const svg = select_default2(contentEl).append("svg").attr("width", "100%").attr("height", "100%").attr("viewBox", "0 0 800 600").attr("preserveAspectRatio", "xMidYMid meet").style("z-index", "0").classed("ikg-graph-svg", true);
     this.svg = svg;
-    const width = SVG_WIDTH;
-    const height = SVG_HEIGHT;
-    const visibleLinks = this.graphState.getVisibleLinks();
-    const links = this.uniqueJsonArray(visibleLinks).map(
-      (d) => Object.create(d)
-    );
-    const nodesById = /* @__PURE__ */ new Map();
-    const visibleNodes = this.graphState.getVisibleNodes();
-    visibleNodes.forEach((d) => {
-      var _a;
-      if (!nodesById.has(d.source)) {
-        nodesById.set(d.source, {
-          id: d.source,
-          image: (_a = d.image) != null ? _a : defaultAvatar,
-          nodeFilePath: d.nodeFilePath,
-          fx: d.fx,
-          fy: d.fy,
-          x: d.x,
-          y: d.y,
-          vx: d.vx,
-          vy: d.vy
-        });
-      }
-    });
-    const nodes = Array.from(nodesById.values());
+    const { nodes, links } = this.collectRenderNodesAndLinks();
+    await this.hydrateVisibleAvatars(nodes);
     const boxedNodes = {};
     const visibleNodeCount = nodes.length;
     const visibleLinkCount = links.length;
-    const shouldRenderDecorations = visibleNodeCount <= this.DECORATION_RENDER_THRESHOLD;
+    const litePaint = this.shouldUseLiteGraphPaint(visibleNodeCount);
+    const allNodesPinned = nodes.length > 0 && nodes.every((node2) => node2.fx != null && node2.fy != null);
+    const shouldRenderDecorations = !litePaint && visibleNodeCount <= this.DECORATION_RENDER_THRESHOLD;
     const renderedLabelCount = nodes.filter((node2) => this.shouldRenderNodeLabel(node2.id, visibleNodeCount)).length;
     const renderedImageCount = nodes.filter((node2) => this.shouldRenderNodeImage(node2.id, visibleNodeCount)).length;
-    const renderMode = visibleNodeCount > this.LABEL_RENDER_THRESHOLD ? "compact-rich" : "full-detail";
+    const renderMode = litePaint ? "lite-paint" : visibleNodeCount > this.getLabelRenderThreshold() ? "compact-rich" : "full-detail";
+    svg.classed("ikg-lite-paint", litePaint);
+    this.liteGraphPaint = litePaint;
+    this.renderedVisibleNodeCount = visibleNodeCount;
+    this.simulationSettled = false;
     box_encapsulations.forEach((box) => {
       box.Nodes.forEach((nodeId) => {
         boxedNodes[nodeId] = box;
       });
     });
+    this.boxedNodesLookup = boxedNodes;
     function boxConstraintForce(boxedNodesDataset) {
-      return function(alpha) {
+      return function(_alpha) {
         nodes.forEach((node2) => {
           const box = boxedNodesDataset[node2.id];
           if (box) {
-            let minX = box.x;
-            let minY = box.y;
-            let maxX = box.x + box.width;
-            let maxY = box.y + box.height;
-            node2.x = Math.max(minX + RADIUS_NODE, Math.min(node2.x, maxX - RADIUS_NODE));
-            node2.y = Math.max(minY + RADIUS_NODE, Math.min(node2.y, maxY - RADIUS_NODE));
+            node2.x = Math.max(box.x + RADIUS_NODE, Math.min(node2.x, box.x + box.width - RADIUS_NODE));
+            node2.y = Math.max(box.y + RADIUS_NODE, Math.min(node2.y, box.y + box.height - RADIUS_NODE));
           }
         });
       };
     }
+    const chargeForce = manyBody_default().strength(visibleNodeCount > 40 ? -90 : -220).theta(litePaint ? 0.95 : 0.9).distanceMax(litePaint ? 280 : 420);
+    const collideForce = collide_default().radius((node2) => this.getNodeCollisionRadius(node2.id, visibleNodeCount)).strength(1).iterations(litePaint ? 1 : 2);
     const simulation = simulation_default(nodes).force(
       "link",
-      link_default(links).distance((link2) => {
-        var _a, _b;
-        const sourceId = typeof link2.source === "string" ? link2.source : (_a = link2.source) == null ? void 0 : _a.id;
-        const targetId = typeof link2.target === "string" ? link2.target : (_b = link2.target) == null ? void 0 : _b.id;
-        const touchesToolbeltNode = sourceId === this.activeNodeToolbeltId || targetId === this.activeNodeToolbeltId;
-        if (touchesToolbeltNode) {
-          return visibleNodeCount > 40 ? 135 : 175;
-        }
-        return visibleNodeCount > 40 ? 75 : 100;
-      }).id((d) => {
-        return d.id;
-      }).strength(0.1)
-    ).force("charge", manyBody_default().strength(visibleNodeCount > 40 ? -120 : -220)).force("collide", collide_default().radius((node2) => this.getNodeCollisionRadius(node2.id, visibleNodeCount)).strength(1).iterations(2)).force("boxConstraint", boxConstraintForce(boxedNodes));
-    simulation.alphaDecay(visibleNodeCount > 40 ? 0.3 : 0.2);
+      link_default(links).distance(() => visibleNodeCount > 40 ? 75 : 100).id((d) => d.id).strength(0.1)
+    ).force("charge", chargeForce).force("collide", collideForce);
+    if (Object.keys(boxedNodes).length > 0) {
+      simulation.force("boxConstraint", boxConstraintForce(boxedNodes));
+    }
+    simulation.alphaDecay(litePaint || visibleNodeCount > 40 ? 0.4 : 0.2);
+    simulation.velocityDecay(litePaint ? 0.55 : 0.4);
+    simulation.stop();
     this.simulation = simulation;
     this.renderedNodeLookup = new Map(nodes.map((node2) => [node2.id, node2]));
     this.updateDiagnosticsPanel({
@@ -15660,11 +16138,13 @@ var AppContainer = class {
       collapsedNodeCount: this.collapsedNodeIds.length,
       searchResultCount: this.searchResultNodeIds.length,
       renderMode,
-      simulationStatus: "starting",
+      simulationStatus: allNodesPinned ? "pinned-static" : "starting",
       alpha: simulation.alpha()
     });
-    svg.append("defs").append("marker").attr("id", "arrowhead").attr("markerWidth", 40).attr("markerHeight", 40).attr("refX", 0).attr("refY", 20).attr("orient", "auto").attr("markerUnits", "strokeWidth").append("polygon").attr("points", "0 0, 40 20, 0 40").attr("fill", "black");
-    svg.append("defs").append("marker").attr("id", "arrow").attr("viewBox", "0 0 10 10").attr("refX", 5).attr("refY", 5).attr("markerWidth", 6).attr("markerHeight", 6).attr("orient", "auto-start-reverse").append("path").attr("d", "M 0 0 L 10 5 L 0 10 z").attr("fill", "white");
+    const svgDefs = svg.append("defs");
+    svgDefs.append("clipPath").attr("id", "ikg-avatar-clip").attr("clipPathUnits", "userSpaceOnUse").append("circle").attr("cx", 0).attr("cy", 0).attr("r", NODE_IMAGE_SIZE / 2);
+    svgDefs.append("marker").attr("id", "arrowhead").attr("markerWidth", 40).attr("markerHeight", 40).attr("refX", 0).attr("refY", 20).attr("orient", "auto").attr("markerUnits", "strokeWidth").append("polygon").attr("points", "0 0, 40 20, 0 40").attr("fill", "black");
+    svgDefs.append("marker").attr("id", "arrow").attr("viewBox", "0 0 10 10").attr("refX", 5).attr("refY", 5).attr("markerWidth", 6).attr("markerHeight", 6).attr("orient", "auto-start-reverse").append("path").attr("d", "M 0 0 L 10 5 L 0 10 z").attr("fill", "white");
     const zoomableGraphContainer = svg.append("g").attr("background-color", "gray");
     const zoomBehavior = zoom_default2().scaleExtent([0.1, 3]).on("zoom", (event) => {
       zoomableGraphContainer.attr("transform", event.transform);
@@ -15682,10 +16162,12 @@ var AppContainer = class {
       this.cancelNodeHold();
       if (this.activeNodeToolbeltId) {
         this.activeNodeToolbeltId = null;
-        void this.rerenderGraph();
+        this.syncSelectionAndToolbelt(null);
       }
     });
-    const link = zoomableGraphContainer.append("g").attr("stroke", "rgba(149, 193, 255, 0.72)").attr("stroke-opacity", 0.9).attr("stroke-width", visibleNodeCount > 40 ? 1.5 : 2.4).attr("marker-end", "url(#arrowhead)").selectAll("line").data(links).join("line");
+    this.graphZoomLayer = zoomableGraphContainer;
+    this.graphLinksLayer = zoomableGraphContainer.append("g").attr("class", "ikg-link-layer").attr("stroke", "rgba(149, 193, 255, 0.72)").attr("stroke-opacity", 0.9).attr("stroke-width", visibleNodeCount > 40 ? 1.5 : 2.4).attr("marker-end", "url(#arrowhead)");
+    const link = this.graphLinksLayer.selectAll("line").data(links, (d) => this.getDirectedLinkKey(d)).join("line");
     if (shouldRenderDecorations) {
       zoomableGraphContainer.append("g").selectAll("rect").data(box_encapsulations).join("rect").attr("x", (d) => d.x).attr("y", (d) => d.y).attr("width", (d) => d.width).attr("height", (d) => d.height).attr("fill", "none").attr("stroke", "orange").attr("stroke-width", 20).call(dragBoundingBoxesBehavior(nodes, boxedNodes));
     }
@@ -15721,59 +16203,39 @@ var AppContainer = class {
       return drag_default().on("start", dragstarted).on("drag", dragged).on("end", dragended);
     }
     if (shouldRenderDecorations) {
+      const width = SVG_WIDTH;
+      const height = SVG_HEIGHT;
       zoomableGraphContainer.append("line").attr("x1", 0).attr("y1", 0).attr("x2", 0).attr("y2", 0.8 * height).attr("stroke", "lightgreen").attr("stroke-width", 2).attr("marker-end", "url(#arrow)");
       zoomableGraphContainer.append("line").attr("x1", 0).attr("y1", 0).attr("x2", 0.8 * width).attr("y2", 0).attr("stroke", "lightblue").attr("stroke-width", 2).attr("marker-end", "url(#arrow)");
     }
-    const node = zoomableGraphContainer.append("g").attr("stroke", "#fff").attr("stroke-width", 1.5).selectAll("g").data(nodes).join("g").attr("class", "ikg-node-group").attr("data-box", (d) => boxedNodes[d.id] ? boxedNodes[d.id].Id : null).call(dragNodeHandler(simulation, this.graphState, () => this.cancelNodeHold())).on("pointerdown", (event, d) => {
-      event.stopPropagation();
-      this.beginNodeHold(event, d, event.currentTarget);
-    }).on("pointerup", () => this.cancelNodeHold()).on("pointerleave", () => this.cancelNodeHold()).on("pointercancel", () => this.cancelNodeHold()).on("click", (event, d) => this.handleNodePrimaryTap(event, d));
-    node.append("circle").attr("class", "ikg-node-hold-ring").attr("r", RADIUS_NODE + 16).attr("fill", "none").attr("stroke", "rgba(244, 114, 182, 0.95)").attr("stroke-width", 6).attr("stroke-linecap", "round").attr("transform", "rotate(-90)").style("opacity", 0).style("display", "none").style("pointer-events", "none");
-    node.filter((d) => this.activeNodeToolbeltId === d.id).append("circle").attr("class", "ikg-node-toolbelt-aura").attr("r", RADIUS_NODE + 26).attr("fill", "rgba(168, 85, 247, 0.08)").attr("stroke", "rgba(244, 114, 182, 0.55)").attr("stroke-width", 2.5).style("pointer-events", "none");
-    node.append("circle").attr("r", RADIUS_NODE).attr("stroke", (d) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds)).attr("stroke-width", (d) => d.id === this.currentSelectedNodeId ? 5 : 3).attr("filter", "drop-shadow(0 14px 26px rgba(15, 23, 42, 0.28))").attr(
-      "fill",
-      (d) => this.identifyColorForNodeCircle(
-        d.id,
-        this.rootNodeIds,
-        this.currentSelectedNodeId,
-        this.searchResultNodeIds
-      )
+    this.graphNodesLayer = zoomableGraphContainer.append("g").attr("class", "ikg-node-layer").attr("stroke", "#fff").attr("stroke-width", 1.5);
+    const node = this.bindNodeSelection(
+      this.graphNodesLayer.selectAll("g.ikg-node-group").data(nodes, (d) => d.id).join("g"),
+      simulation,
+      boxedNodes,
+      visibleNodeCount,
+      litePaint,
+      true
     );
-    node.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("rect").attr("width", WIDTH_NODE_TITLE_BAR + 36).attr("height", HEIGHT_NODE_TITLE_BAR + 8).attr("rx", 16).attr("ry", 16).attr("x", -(WIDTH_NODE_TITLE_BAR + 28) / 2).attr("y", RADIUS_NODE + 10).attr("fill", "rgba(15, 23, 42, 0.64)").attr("stroke", "rgba(191, 219, 254, 0.16)").attr("stroke-width", 1);
-    node.filter((d) => this.shouldRenderNodeImage(d.id, visibleNodeCount)).append("image").attr("clip-path", "circle(40px at center)").attr("xlink:href", (d) => {
-      var _a;
-      return (_a = d.image) != null ? _a : defaultAvatar;
-    }).attr("x", -NODE_IMAGE_SIZE / 2).attr("y", -NODE_IMAGE_SIZE / 2).attr("width", NODE_IMAGE_SIZE).attr("height", NODE_IMAGE_SIZE).style("pointer-events", "none");
-    node.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("x", 0).attr("y", RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(248, 250, 252, 0.96)").attr("stroke", "rgba(15, 23, 42, 0.92)").attr("stroke-width", 0.75).attr("paint-order", "stroke").attr("font-size", visibleNodeCount > 80 ? 9 : 10.5).attr("font-weight", 450).attr("letter-spacing", "0").style("font-family", "var(--font-interface)").style("text-rendering", "geometricPrecision").style("shape-rendering", "geometricPrecision").style("-webkit-font-smoothing", "antialiased").text((d) => d.id.length > 18 ? `${d.id.slice(0, 18)}\u2026` : d.id);
-    node.append("circle").attr("cx", -RADIUS_NODE * 0.68).attr("cy", -RADIUS_NODE * 0.68).attr("r", 14).attr("fill", (d) => this.canNodeExpand(d.id) ? "rgba(34,197,94,0.95)" : this.canNodeCollapse(d.id) ? "rgba(245,158,11,0.95)" : "rgba(100,116,139,0.82)").attr("stroke", "rgba(255,255,255,0.85)").attr("stroke-width", 1.5);
-    node.append("text").attr("x", -RADIUS_NODE * 0.68).attr("y", -RADIUS_NODE * 0.68 + 0.5).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", 13).attr("font-weight", 700).style("pointer-events", "none").style("font-family", "var(--font-interface)").style("text-rendering", "geometricPrecision").text((d) => this.canNodeExpand(d.id) ? "+" : this.canNodeCollapse(d.id) ? "\u2013" : "\u2022");
-    node.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("x", RADIUS_NODE * 0.8).attr("y", -RADIUS_NODE).attr("text-anchor", "middle").attr("text-color", "purple").attr("alignment-baseline", "middle").attr("fill", "rgba(147, 197, 253, 0.88)").attr("font-size", 10).attr("font-weight", 600).text(
-      (d) => `${this.graphState.getNodeNeighborCount(d.id)}`
-    );
-    node.filter((d) => this.activeNodeToolbeltId === d.id).each((d, index2, groups) => {
-      const host = select_default2(groups[index2]).append("g").attr("class", "ikg-node-toolbelt");
-      const actions = this.getNodeActionBubbles(d.id);
-      const bubble = host.selectAll("g").data(actions).join("g").attr("class", "ikg-node-action-bubble").attr("transform", (action) => {
-        const angle = action.angle * Math.PI / 180;
-        const radius = NODE_TOOLBELT_BUBBLE_DISTANCE;
-        return `translate(${Math.cos(angle) * radius},${Math.sin(angle) * radius})`;
-      }).style("cursor", "pointer").on("click", (event, action) => {
-        event.stopPropagation();
-        void this.handleNodeActionBubble(action.key, d.id);
-      });
-      bubble.append("circle").attr("r", 24).attr("fill", "rgba(15, 23, 42, 0.92)").attr("stroke", "rgba(191, 219, 254, 0.5)").attr("stroke-width", 1.8).attr("filter", "drop-shadow(0 10px 18px rgba(15, 23, 42, 0.32))");
-      bubble.append("text").attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", 16).style("pointer-events", "none").text((action) => action.emoji);
-      bubble.append("text").attr("y", 38).attr("text-anchor", "middle").attr("fill", "rgba(241, 245, 249, 0.92)").attr("font-size", 9).attr("font-weight", 600).style("pointer-events", "none").text((action) => action.label);
-    });
+    this.graphNodeSelection = node;
+    this.graphLinkSelection = link;
+    this.captureGraphElementLookups(node);
+    this.indexIncidentLinks();
+    this.paintGraphFrame(true);
+    if (this.activeNodeToolbeltId) {
+      const toolbeltHost = this.nodeElementLookup.get(this.activeNodeToolbeltId);
+      if (toolbeltHost) {
+        this.attachNodeToolbelt(toolbeltHost, this.activeNodeToolbeltId);
+      }
+    }
     let lastDiagnosticsUpdate = 0;
     simulation.on("tick", () => {
-      link.attr("x1", (d) => d.source.x).attr("y1", (d) => d.source.y).attr("x2", (d) => d.target.x).attr("y2", (d) => d.target.y);
-      node.attr("transform", (d) => {
-        var _a, _b;
-        return `translate(${Math.round((_a = d.x) != null ? _a : 0)},${Math.round((_b = d.y) != null ? _b : 0)})`;
-      });
+      this.scheduleGraphPaint();
+      if (!this.diagnosticsVisible) {
+        return;
+      }
       const now2 = Date.now();
-      if (now2 - lastDiagnosticsUpdate > 200) {
+      if (now2 - lastDiagnosticsUpdate > 400) {
         lastDiagnosticsUpdate = now2;
         this.updateDiagnosticsPanel({
           visibleNodes: visibleNodeCount,
@@ -15791,6 +16253,11 @@ var AppContainer = class {
       }
     });
     simulation.on("end", () => {
+      if (this.simulation !== simulation) {
+        return;
+      }
+      this.pinRenderedNodesInPlace();
+      this.settleSimulation("settled");
       this.updateDiagnosticsPanel({
         visibleNodes: visibleNodeCount,
         visibleLinks: visibleLinkCount,
@@ -15805,10 +16272,19 @@ var AppContainer = class {
         alpha: simulation.alpha()
       });
     });
-    window.setTimeout(() => {
-      if (this.simulation === simulation) {
-        simulation.alphaTarget(0);
-        simulation.stop();
+    if (allNodesPinned) {
+      simulation.stop();
+      simulation.tick();
+      this.pinRenderedNodesInPlace();
+      this.settleSimulation("pinned-static");
+    } else {
+      simulation.alpha(1).restart();
+      this.simulationAutoStopHandle = window.setTimeout(() => {
+        if (this.simulation !== simulation) {
+          return;
+        }
+        this.pinRenderedNodesInPlace();
+        this.settleSimulation("auto-stopped");
         this.updateDiagnosticsPanel({
           visibleNodes: visibleNodeCount,
           visibleLinks: visibleLinkCount,
@@ -15822,83 +16298,171 @@ var AppContainer = class {
           simulationStatus: "auto-stopped",
           alpha: simulation.alpha()
         });
-      }
-    }, visibleNodeCount > 40 ? 1200 : 2200);
-    function dragNodeHandler(simulation2, graphStateRef, onDragStart) {
-      function updateNodePosition(nodeId, fx, fy) {
-        const node2 = graphStateRef.getNodeById(nodeId);
-        if (node2) {
-          node2.fx = fx;
-          node2.fy = fy;
-        }
-        graphStateRef.updateNodeCoordinates(nodeId, { fx, fy });
-      }
-      function dragstarted(event, d) {
-        onDragStart();
-        if (!event.active) {
-          simulation2.alphaTarget(0.3).restart();
-        }
-        const box = boxedNodes[d.id];
-        let selectedX = 0;
-        let selectedY = 0;
-        if (box) {
-          const minX = box.x;
-          const maxX = box.x + box.width;
-          const minY = box.y;
-          const maxY = box.y + box.height;
-          selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-          selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-        } else {
-          selectedX = event.x;
-          selectedY = event.y;
-        }
-        d.fx = selectedX;
-        d.fy = selectedY;
-        updateNodePosition(d.id, selectedX, selectedY);
-      }
-      function dragged(event, d) {
-        const box = boxedNodes[d.id];
-        let selectedX = 0;
-        let selectedY = 0;
-        if (box) {
-          const minX = box.x;
-          const maxX = box.x + box.width;
-          const minY = box.y;
-          const maxY = box.y + box.height;
-          selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-          selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-        } else {
-          selectedX = event.x;
-          selectedY = event.y;
-        }
-        d.fx = selectedX;
-        d.fy = selectedY;
-        updateNodePosition(d.id, selectedX, selectedY);
-      }
-      function dragended(event, d) {
-        if (!event.active)
-          simulation2.alphaTarget(0);
-        let selectedX = 0;
-        let selectedY = 0;
-        const box = boxedNodes[d.id];
-        if (box) {
-          const minX = box.x;
-          const maxX = box.x + box.width;
-          const minY = box.y;
-          const maxY = box.y + box.height;
-          selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-          selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-        } else {
-          selectedX = event.x;
-          selectedY = event.y;
-        }
-        d.fx = selectedX;
-        d.fy = selectedY;
-        updateNodePosition(d.id, selectedX, selectedY);
-      }
-      return drag_default().on("start", dragstarted).on("drag", dragged).on("end", dragended);
+      }, litePaint ? 800 : visibleNodeCount > 40 ? 1200 : 2200);
     }
     return svg;
+  }
+  bindNodeSelection(selection2, simulation, boxedNodes, visibleNodeCount, litePaint, decorateAll) {
+    selection2.attr("class", (d) => `ikg-node-group${d.id === this.currentSelectedNodeId ? " is-selected" : ""}${d.id === this.activeNodeToolbeltId ? " is-toolbelt-host" : ""}`).attr("data-box", (d) => boxedNodes[d.id] ? boxedNodes[d.id].Id : null).attr("data-node-id", (d) => d.id).call(this.createNodeDragHandler(simulation)).on("pointerdown", (event, d) => {
+      event.stopPropagation();
+      this.beginNodeHold(event, d, event.currentTarget);
+    }).on("pointerup", () => this.cancelNodeHold()).on("pointerleave", () => this.cancelNodeHold()).on("pointercancel", () => this.cancelNodeHold()).on("click", (event, d) => this.handleNodePrimaryTap(event, d));
+    if (decorateAll) {
+      this.decorateGraphNodeSelection(selection2, visibleNodeCount, litePaint);
+    }
+    return selection2;
+  }
+  decorateGraphNodeSelection(selection2, visibleNodeCount, litePaint) {
+    selection2.append("circle").attr("class", "ikg-node-hold-ring").attr("r", RADIUS_NODE + 16).attr("fill", "none").attr("stroke", "rgba(244, 114, 182, 0.95)").attr("stroke-width", 6).attr("stroke-linecap", "round").attr("transform", "rotate(-90)").style("opacity", 0).style("display", "none").style("pointer-events", "none");
+    selection2.append("circle").attr("class", "ikg-node-core").attr("r", RADIUS_NODE).attr("stroke", (d) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds)).attr("stroke-width", (d) => d.id === this.currentSelectedNodeId ? 5 : 3).attr(
+      "fill",
+      (d) => this.identifyColorForNodeCircle(
+        d.id,
+        this.rootNodeIds,
+        this.currentSelectedNodeId,
+        this.searchResultNodeIds
+      )
+    );
+    selection2.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("rect").attr("class", "ikg-node-label-bg").attr("width", WIDTH_NODE_TITLE_BAR + 36).attr("height", HEIGHT_NODE_TITLE_BAR + 8).attr("rx", 16).attr("ry", 16).attr("x", -(WIDTH_NODE_TITLE_BAR + 28) / 2).attr("y", RADIUS_NODE + 10).attr("fill", "rgba(15, 23, 42, 0.64)").attr("stroke", "rgba(191, 219, 254, 0.16)").attr("stroke-width", 1).style("pointer-events", "none");
+    selection2.append("image").attr("class", "ikg-node-avatar").attr("clip-path", "url(#ikg-avatar-clip)").attr("href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    }).attr("xlink:href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    }).attr("x", -NODE_IMAGE_SIZE / 2).attr("y", -NODE_IMAGE_SIZE / 2).attr("width", NODE_IMAGE_SIZE).attr("height", NODE_IMAGE_SIZE).attr("preserveAspectRatio", "xMidYMid slice").style("pointer-events", "none");
+    const labelText = selection2.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("class", "ikg-node-label").attr("x", 0).attr("y", RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(248, 250, 252, 0.96)").attr("stroke", "rgba(15, 23, 42, 0.92)").attr("stroke-width", 0.75).attr("paint-order", "stroke").attr("font-size", visibleNodeCount > 80 ? 9 : 10.5).attr("font-weight", 450).style("font-family", "var(--font-interface)").style("pointer-events", "none").text((d) => d.id.length > 18 ? `${d.id.slice(0, 18)}\u2026` : d.id);
+    if (!litePaint) {
+      labelText.style("text-rendering", "geometricPrecision").style("shape-rendering", "geometricPrecision").style("-webkit-font-smoothing", "antialiased");
+    }
+    selection2.append("circle").attr("class", "ikg-node-badge").attr("cx", -RADIUS_NODE * 0.68).attr("cy", -RADIUS_NODE * 0.68).attr("r", 14).attr("fill", (d) => this.canNodeExpand(d.id) ? "rgba(34,197,94,0.95)" : this.canNodeCollapse(d.id) ? "rgba(245,158,11,0.95)" : "rgba(100,116,139,0.82)").attr("stroke", "rgba(255,255,255,0.85)").attr("stroke-width", 1.5);
+    selection2.append("text").attr("class", "ikg-node-badge-label").attr("x", -RADIUS_NODE * 0.68).attr("y", -RADIUS_NODE * 0.68 + 0.5).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", 13).attr("font-weight", 700).style("pointer-events", "none").style("font-family", "var(--font-interface)").text((d) => this.canNodeExpand(d.id) ? "+" : this.canNodeCollapse(d.id) ? "\u2013" : "\u2022");
+    selection2.filter((d) => this.shouldRenderNodeLabel(d.id, visibleNodeCount)).append("text").attr("class", "ikg-node-neighbor-count").attr("x", RADIUS_NODE * 0.8).attr("y", -RADIUS_NODE).attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "rgba(147, 197, 253, 0.88)").attr("font-size", 10).attr("font-weight", 600).style("pointer-events", "none").text((d) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+  }
+  syncGraphNodeChrome(selection2, visibleNodeCount) {
+    selection2.attr("class", (d) => `ikg-node-group${d.id === this.currentSelectedNodeId ? " is-selected" : ""}${d.id === this.activeNodeToolbeltId ? " is-toolbelt-host" : ""}`).attr("data-node-id", (d) => d.id);
+    selection2.select(".ikg-node-core").attr("stroke", (d) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds)).attr("stroke-width", (d) => d.id === this.currentSelectedNodeId ? 5 : 3).attr(
+      "fill",
+      (d) => this.identifyColorForNodeCircle(
+        d.id,
+        this.rootNodeIds,
+        this.currentSelectedNodeId,
+        this.searchResultNodeIds
+      )
+    );
+    selection2.select(".ikg-node-avatar").attr("href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    }).attr("xlink:href", (d) => {
+      var _a;
+      return (_a = d.image) != null ? _a : defaultAvatar;
+    });
+    selection2.select(".ikg-node-badge").attr("fill", (d) => this.canNodeExpand(d.id) ? "rgba(34,197,94,0.95)" : this.canNodeCollapse(d.id) ? "rgba(245,158,11,0.95)" : "rgba(100,116,139,0.82)");
+    selection2.select(".ikg-node-badge-label").text((d) => this.canNodeExpand(d.id) ? "+" : this.canNodeCollapse(d.id) ? "\u2013" : "\u2022");
+    selection2.select(".ikg-node-neighbor-count").text((d) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+  }
+  captureGraphElementLookups(nodeSelection) {
+    this.nodeElementLookup = /* @__PURE__ */ new Map();
+    nodeSelection.each((d, index2, groups) => {
+      this.nodeElementLookup.set(d.id, groups[index2]);
+    });
+  }
+  async patchCanvasGraphDisplay() {
+    var _a, _b, _c, _d, _e, _f, _g;
+    if (!this.svg || !this.graphZoomLayer || !this.graphLinksLayer || !this.graphNodesLayer || !this.simulation) {
+      return false;
+    }
+    if (!((_a = this.svg.node()) == null ? void 0 : _a.isConnected) || !((_b = this.graphNodesLayer.node()) == null ? void 0 : _b.isConnected)) {
+      return false;
+    }
+    const { nodes, links } = this.collectRenderNodesAndLinks();
+    if (nodes.length === 0) {
+      return false;
+    }
+    const visibleNodeCount = nodes.length;
+    const visibleLinkCount = links.length;
+    const litePaint = this.shouldUseLiteGraphPaint(visibleNodeCount);
+    if (litePaint !== this.liteGraphPaint) {
+      return false;
+    }
+    await this.hydrateVisibleAvatars(nodes);
+    const boxedNodes = {};
+    box_encapsulations.forEach((box) => {
+      box.Nodes.forEach((nodeId) => {
+        boxedNodes[nodeId] = box;
+      });
+    });
+    this.boxedNodesLookup = boxedNodes;
+    this.renderedVisibleNodeCount = visibleNodeCount;
+    this.liteGraphPaint = litePaint;
+    this.svg.classed("ikg-lite-paint", litePaint);
+    this.graphLinksLayer.attr("stroke-width", visibleNodeCount > 40 ? 1.5 : 2.4);
+    const linkJoin = this.graphLinksLayer.selectAll("line").data(links, (d) => this.getDirectedLinkKey(d));
+    linkJoin.exit().remove();
+    linkJoin.enter().append("line");
+    this.graphLinkSelection = this.graphLinksLayer.selectAll("line");
+    const nodeJoin = this.graphNodesLayer.selectAll("g.ikg-node-group").data(nodes, (d) => d.id);
+    nodeJoin.exit().remove();
+    const nodeEnter = nodeJoin.enter().append("g").attr("class", "ikg-node-group");
+    this.bindNodeSelection(nodeEnter, this.simulation, boxedNodes, visibleNodeCount, litePaint, true);
+    this.graphNodeSelection = nodeEnter.merge(nodeJoin);
+    this.syncGraphNodeChrome(this.graphNodeSelection, visibleNodeCount);
+    this.captureGraphElementLookups(this.graphNodeSelection);
+    this.indexIncidentLinks();
+    this.renderedNodeLookup = new Map(nodes.map((node) => [node.id, node]));
+    this.simulation.nodes(nodes);
+    const linkForce = this.simulation.force("link");
+    (_c = linkForce == null ? void 0 : linkForce.links) == null ? void 0 : _c.call(linkForce, links);
+    const collideForce = this.simulation.force("collide");
+    (_d = collideForce == null ? void 0 : collideForce.radius) == null ? void 0 : _d.call(collideForce, (node) => this.getNodeCollisionRadius(node.id, visibleNodeCount));
+    this.simulation.stop();
+    this.simulationSettled = true;
+    if (this.activeNodeToolbeltId && !this.nodeElementLookup.has(this.activeNodeToolbeltId)) {
+      this.activeNodeToolbeltId = this.currentSelectedNodeId;
+    }
+    if (this.activeNodeToolbeltId) {
+      this.syncSelectionAndToolbelt(this.activeNodeToolbeltId);
+    } else {
+      this.refreshRenderedNodePaints();
+    }
+    this.paintGraphFrame(true);
+    const allNodesPinned = nodes.every((node) => node.fx != null && node.fy != null);
+    this.updateDiagnosticsPanel({
+      visibleNodes: visibleNodeCount,
+      visibleLinks: visibleLinkCount,
+      renderedLabels: nodes.filter((node) => this.shouldRenderNodeLabel(node.id, visibleNodeCount)).length,
+      renderedImages: nodes.filter((node) => this.shouldRenderNodeImage(node.id, visibleNodeCount)).length,
+      selectedNodeId: this.currentSelectedNodeId,
+      rootNodeCount: this.rootNodeIds.length,
+      collapsedNodeCount: this.collapsedNodeIds.length,
+      searchResultCount: this.searchResultNodeIds.length,
+      renderMode: litePaint ? "lite-static" : visibleNodeCount > this.getLabelRenderThreshold() ? "compact-rich" : "full-detail",
+      simulationStatus: allNodesPinned ? "patched-static" : "patched",
+      alpha: (_g = (_f = (_e = this.simulation).alpha) == null ? void 0 : _f.call(_e)) != null ? _g : 0
+    });
+    return true;
+  }
+  createNodeDragHandler(simulation) {
+    const applyDragPosition = (event, d) => {
+      const next = this.constrainDragPosition(d.id, event.x, event.y);
+      this.applyKinematicNodeMove(d, next.x, next.y);
+    };
+    return drag_default().clickDistance(12).on("start", (event, d) => {
+      this.cancelNodeHold();
+      this.setGraphDragging(true, d.id);
+      applyDragPosition(event, d);
+      if (!this.simulationSettled && !event.active) {
+        simulation.alphaTarget(0.18).restart();
+      }
+    }).on("drag", (event, d) => {
+      applyDragPosition(event, d);
+    }).on("end", (event, d) => {
+      applyDragPosition(event, d);
+      this.setGraphDragging(false);
+      if (!this.simulationSettled && !event.active) {
+        simulation.alphaTarget(0);
+      }
+    });
   }
   // section 2 ---------------------------- Graph Nodes/Links Renders and Behaviors
   focusOnNode(nodeId) {
@@ -15909,7 +16473,11 @@ var AppContainer = class {
     if (nodeData && this.svg && this.zoomBehavior) {
       const x3 = (_b = nodeData.fx) != null ? _b : nodeData.x;
       const y3 = (_c = nodeData.fy) != null ? _c : nodeData.y;
-      this.svg.transition().duration(300).call(
+      if (x3 == null || y3 == null) {
+        return;
+      }
+      const duration = this.isCoarsePointerDevice() ? 0 : 180;
+      this.svg.transition().duration(duration).call(
         this.zoomBehavior.transform,
         identity2.translate(width / 2, height / 2).scale(1).translate(-x3, -y3)
       );
@@ -16016,8 +16584,18 @@ var AppContainer = class {
   }
   // section 4 ---------------------------- Tools and Utils
   uniqueJsonArray(arr) {
-    const uniqueSet = new Set(arr.map((obj) => JSON.stringify(obj)));
-    return Array.from(uniqueSet).map((str) => JSON.parse(str));
+    var _a, _b, _c;
+    const seen = /* @__PURE__ */ new Set();
+    const unique = [];
+    for (const obj of arr) {
+      const key = `${(_a = obj == null ? void 0 : obj.source) != null ? _a : ""}\0${(_b = obj == null ? void 0 : obj.target) != null ? _b : ""}\0${(_c = obj == null ? void 0 : obj.zIndex) != null ? _c : ""}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      unique.push(obj);
+    }
+    return unique;
   }
   // section 4 ---------------------------- Tools and Utils
   // bookmark__visual_tools_node_coloring
