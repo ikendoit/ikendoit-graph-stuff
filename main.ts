@@ -605,10 +605,35 @@ class AppContainer {
 	mapSectionExpanded: Record<string, boolean> = {};
 	layoutObserver: ResizeObserver | null = null;
 	layoutSyncFrameHandle: number | null = null;
+	graphNodeSelection: any = null;
+	graphLinkSelection: any = null;
+	nodeElementLookup: Map<string, SVGGElement> = new Map();
+	incidentLinkEnds: Map<string, Array<{ el: SVGLineElement; end: 'source' | 'target' }>> = new Map();
+	boxedNodesLookup: Record<string, any> = {};
+	simulationSettled = false;
+	simulationAutoStopHandle: number | null = null;
+	graphIsDragging = false;
+	renderedVisibleNodeCount = 0;
+	liteGraphPaint = false;
+	lastDiagnosticsData: {
+		visibleNodes: number;
+		visibleLinks: number;
+		renderedLabels: number;
+		renderedImages: number;
+		selectedNodeId: string | null;
+		rootNodeCount: number;
+		collapsedNodeCount: number;
+		searchResultCount: number;
+		renderMode: string;
+		simulationStatus: string;
+		alpha?: number;
+	} | null = null;
 
 	private readonly LABEL_RENDER_THRESHOLD = 120;
 	private readonly IMAGE_RENDER_THRESHOLD = 90;
 	private readonly DECORATION_RENDER_THRESHOLD = 50;
+	private readonly MOBILE_LABEL_RENDER_THRESHOLD = 64;
+	private readonly MOBILE_IMAGE_RENDER_THRESHOLD = 36;
 
 
 	constructor(parentAppContainer: any,
@@ -783,7 +808,19 @@ class AppContainer {
 
 	private clearGraphCanvas() {
 		const contentEl = this.graphContainerPanel.view.containerEl;
+		if (this.simulationAutoStopHandle != null) {
+			window.clearTimeout(this.simulationAutoStopHandle);
+			this.simulationAutoStopHandle = null;
+		}
 		this.simulation?.stop();
+		this.simulation = null;
+		this.simulationSettled = false;
+		this.graphIsDragging = false;
+		this.graphNodeSelection = null;
+		this.graphLinkSelection = null;
+		this.nodeElementLookup = new Map();
+		this.incidentLinkEnds = new Map();
+		this.boxedNodesLookup = {};
 		d3.select(contentEl).select('svg').remove();
 		this.renderedNodeLookup = new Map();
 	}
@@ -831,6 +868,9 @@ class AppContainer {
 	private toggleDiagnosticsVisibility(forceValue?: boolean) {
 		this.diagnosticsVisible = typeof forceValue === 'boolean' ? forceValue : !this.diagnosticsVisible;
 		this.refreshDiagnosticsVisibility();
+		if (this.diagnosticsVisible && this.lastDiagnosticsData) {
+			this.updateDiagnosticsPanel(this.lastDiagnosticsData);
+		}
 	}
 
 	private refreshModeButtons() {
@@ -1007,6 +1047,10 @@ class AppContainer {
 		simulationStatus: string;
 		alpha?: number;
 	}) {
+		this.lastDiagnosticsData = data;
+		if (!this.diagnosticsVisible || this.currentMode !== 'graph') {
+			return;
+		}
 		const panel = this.ensureDiagnosticsPanel();
 		const rows = [
 			['Mode', data.renderMode],
@@ -1022,6 +1066,262 @@ class AppContainer {
 		];
 
 		panel.innerHTML = `<div class="graph-diagnostics-panel__title">Graph diagnostics</div>${rows.map(([k,v]) => `<div class="graph-diagnostics-panel__row"><span>${k}</span><span>${v}</span></div>`).join('')}`;
+	}
+
+	private isCoarsePointerDevice() {
+		return Boolean(this.parentAppContainer?.isMobile)
+			|| (typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches);
+	}
+
+	private getLabelRenderThreshold() {
+		return this.isCoarsePointerDevice() ? this.MOBILE_LABEL_RENDER_THRESHOLD : this.LABEL_RENDER_THRESHOLD;
+	}
+
+	private getImageRenderThreshold() {
+		return this.isCoarsePointerDevice() ? this.MOBILE_IMAGE_RENDER_THRESHOLD : this.IMAGE_RENDER_THRESHOLD;
+	}
+
+	private shouldUseLiteGraphPaint(visibleNodeCount: number) {
+		return this.isCoarsePointerDevice() || visibleNodeCount > 28;
+	}
+
+	private indexIncidentLinks() {
+		const index = new Map<string, Array<{ el: SVGLineElement; end: 'source' | 'target' }>>();
+		this.graphLinkSelection?.each(function (this: SVGLineElement, link: any) {
+			const source = link.source;
+			const target = link.target;
+			const sourceId = typeof source === 'string' ? source : source?.id;
+			const targetId = typeof target === 'string' ? target : target?.id;
+			if (sourceId) {
+				const list = index.get(sourceId) ?? [];
+				list.push({ el: this, end: 'source' });
+				index.set(sourceId, list);
+			}
+			if (targetId) {
+				const list = index.get(targetId) ?? [];
+				list.push({ el: this, end: 'target' });
+				index.set(targetId, list);
+			}
+		});
+		this.incidentLinkEnds = index;
+	}
+
+	private graphDomMatchesVisibleState() {
+		const visibleIds = this.graphState.getDisplayableNodeIds();
+		if (visibleIds.length !== this.renderedNodeLookup.size) {
+			return false;
+		}
+		return visibleIds.every((nodeId) => this.renderedNodeLookup.has(nodeId));
+	}
+
+	private pinRenderedNodesInPlace() {
+		this.renderedNodeLookup.forEach((node: any, nodeId: string) => {
+			const x = node.fx ?? node.x;
+			const y = node.fy ?? node.y;
+			if (x == null || y == null) {
+				return;
+			}
+			node.x = x;
+			node.y = y;
+			node.fx = x;
+			node.fy = y;
+			node.vx = 0;
+			node.vy = 0;
+			this.graphState.updateNodeCoordinates(nodeId, { fx: x, fy: y });
+		});
+	}
+
+	private settleSimulation(status: string) {
+		this.simulation?.alphaTarget(0);
+		this.simulation?.stop();
+		this.simulationSettled = true;
+		if (this.simulationAutoStopHandle != null) {
+			window.clearTimeout(this.simulationAutoStopHandle);
+			this.simulationAutoStopHandle = null;
+		}
+		this.paintGraphFrame();
+		this.updateDiagnosticsPanel({
+			visibleNodes: this.renderedVisibleNodeCount,
+			visibleLinks: this.graphLinkSelection?.size?.() ?? this.graphState.getVisibleLinks().length,
+			renderedLabels: this.renderedVisibleNodeCount,
+			renderedImages: this.renderedVisibleNodeCount,
+			selectedNodeId: this.currentSelectedNodeId,
+			rootNodeCount: this.rootNodeIds.length,
+			collapsedNodeCount: this.collapsedNodeIds.length,
+			searchResultCount: this.searchResultNodeIds.length,
+			renderMode: this.liteGraphPaint ? 'lite-static' : 'full-detail',
+			simulationStatus: status,
+			alpha: this.simulation?.alpha?.() ?? 0,
+		});
+	}
+
+	private paintGraphFrame() {
+		this.graphLinkSelection
+			?.attr('x1', (d: { source: { x: any } }) => d.source.x)
+			.attr('y1', (d: { source: { y: any } }) => d.source.y)
+			.attr('x2', (d: { target: { x: any } }) => d.target.x)
+			.attr('y2', (d: { target: { y: any } }) => d.target.y);
+		this.graphNodeSelection
+			?.attr('transform', (d: { x?: number; y?: number }) => `translate(${d.x ?? 0},${d.y ?? 0})`);
+	}
+
+	private constrainDragPosition(nodeId: string, x: number, y: number) {
+		const box = this.boxedNodesLookup[nodeId];
+		if (!box) {
+			return { x, y };
+		}
+		return {
+			x: Math.max(box.x + RADIUS_NODE, Math.min(x, box.x + box.width - RADIUS_NODE)),
+			y: Math.max(box.y + RADIUS_NODE, Math.min(y, box.y + box.height - RADIUS_NODE)),
+		};
+	}
+
+	private applyKinematicNodeMove(d: any, x: number, y: number) {
+		d.x = x;
+		d.y = y;
+		d.fx = x;
+		d.fy = y;
+		d.vx = 0;
+		d.vy = 0;
+		this.graphState.updateNodeCoordinates(d.id, { fx: x, fy: y });
+		const nodeEl = this.nodeElementLookup.get(d.id);
+		if (nodeEl) {
+			nodeEl.setAttribute('transform', `translate(${x},${y})`);
+		}
+		const incident = this.incidentLinkEnds.get(d.id);
+		if (incident) {
+			for (const item of incident) {
+				if (item.end === 'source') {
+					item.el.setAttribute('x1', String(x));
+					item.el.setAttribute('y1', String(y));
+				} else {
+					item.el.setAttribute('x2', String(x));
+					item.el.setAttribute('y2', String(y));
+				}
+			}
+		}
+	}
+
+	private setGraphDragging(active: boolean, nodeId?: string) {
+		this.graphIsDragging = active;
+		const svgNode = this.svg?.node?.() as SVGSVGElement | undefined;
+		svgNode?.classList.toggle('ikg-is-dragging', active);
+		this.nodeElementLookup.forEach((element, id) => {
+			element.classList.toggle('is-dragging', Boolean(active && id === nodeId));
+		});
+	}
+
+	private refreshRenderedNodePaints() {
+		this.nodeElementLookup.forEach((element, nodeId) => {
+			const core = element.querySelector('.ikg-node-core') as SVGCircleElement | null;
+			if (!core) {
+				return;
+			}
+			core.setAttribute('fill', this.identifyColorForNodeCircle(
+				nodeId,
+				this.rootNodeIds,
+				this.currentSelectedNodeId,
+				this.searchResultNodeIds,
+			));
+			core.setAttribute('stroke', this.identifyStrokeForNodeCircle(
+				nodeId,
+				this.rootNodeIds,
+				this.currentSelectedNodeId,
+				this.searchResultNodeIds,
+			));
+			core.setAttribute('stroke-width', nodeId === this.currentSelectedNodeId ? '5' : '3');
+			element.classList.toggle('is-selected', nodeId === this.currentSelectedNodeId);
+			element.classList.toggle('is-toolbelt-host', nodeId === this.activeNodeToolbeltId);
+		});
+	}
+
+	private clearRenderedNodeToolbelts() {
+		this.nodeElementLookup.forEach((element) => {
+			element.querySelectorAll('.ikg-node-toolbelt, .ikg-node-toolbelt-aura').forEach((child) => child.remove());
+			element.classList.remove('is-toolbelt-host');
+		});
+	}
+
+	private attachNodeToolbelt(groupEl: SVGGElement, nodeId: string) {
+		const hostSelection = d3.select(groupEl);
+		hostSelection.append('circle')
+			.attr('class', 'ikg-node-toolbelt-aura')
+			.attr('r', RADIUS_NODE + 26)
+			.attr('fill', 'rgba(168, 85, 247, 0.08)')
+			.attr('stroke', 'rgba(244, 114, 182, 0.55)')
+			.attr('stroke-width', 2.5)
+			.style('pointer-events', 'none');
+
+		const host = hostSelection.append('g').attr('class', 'ikg-node-toolbelt');
+		const actions = this.getNodeActionBubbles(nodeId);
+		const bubble = host.selectAll('g')
+			.data(actions)
+			.join('g')
+			.attr('class', 'ikg-node-action-bubble')
+			.attr('transform', (action: any) => {
+				const angle = (action.angle * Math.PI) / 180;
+				const radius = NODE_TOOLBELT_BUBBLE_DISTANCE;
+				return `translate(${Math.cos(angle) * radius},${Math.sin(angle) * radius})`;
+			})
+			.style('cursor', 'pointer')
+			.on('click', (event: any, action: any) => {
+				event.stopPropagation();
+				void this.handleNodeActionBubble(action.key, nodeId);
+			});
+
+		bubble.append('circle')
+			.attr('r', 24)
+			.attr('fill', 'rgba(15, 23, 42, 0.92)')
+			.attr('stroke', 'rgba(191, 219, 254, 0.5)')
+			.attr('stroke-width', 1.8);
+
+		bubble.append('text')
+			.attr('text-anchor', 'middle')
+			.attr('alignment-baseline', 'middle')
+			.attr('fill', '#fff')
+			.attr('font-size', 16)
+			.style('pointer-events', 'none')
+			.text((action: any) => action.emoji);
+
+		bubble.append('text')
+			.attr('y', 38)
+			.attr('text-anchor', 'middle')
+			.attr('fill', 'rgba(241, 245, 249, 0.92)')
+			.attr('font-size', 9)
+			.attr('font-weight', 600)
+			.style('pointer-events', 'none')
+			.text((action: any) => action.label);
+
+		hostSelection.raise();
+		groupEl.classList.add('is-toolbelt-host');
+	}
+
+	private syncSelectionAndToolbelt(nodeId: string | null) {
+		this.clearRenderedNodeToolbelts();
+		this.refreshRenderedNodePaints();
+		if (!nodeId) {
+			return;
+		}
+		const groupEl = this.nodeElementLookup.get(nodeId);
+		if (!groupEl) {
+			return;
+		}
+		this.attachNodeToolbelt(groupEl, nodeId);
+	}
+
+	private async refreshGraphAfterInteraction(nodeId: string, options: { focusNode?: boolean } = {}) {
+		const { focusNode = true } = options;
+		if (this.graphDomMatchesVisibleState() && this.svg) {
+			this.syncSelectionAndToolbelt(this.activeNodeToolbeltId ?? nodeId);
+			if (focusNode) {
+				this.focusOnNode(nodeId);
+			}
+			return;
+		}
+		await this.rerenderGraph();
+		if (focusNode) {
+			this.focusOnNode(nodeId);
+		}
 	}
 
 	// section 1 ---------------------------- Canvas Application UI
@@ -1088,7 +1388,7 @@ class AppContainer {
 
 	private shouldRenderNodeLabel(nodeId: string, visibleNodeCount: number) {
 		return (
-			visibleNodeCount <= this.LABEL_RENDER_THRESHOLD ||
+			visibleNodeCount <= this.getLabelRenderThreshold() ||
 			nodeId === this.currentSelectedNodeId ||
 			this.rootNodeIds.includes(nodeId) ||
 			this.searchResultNodeIds.includes(nodeId)
@@ -1097,7 +1397,7 @@ class AppContainer {
 
 	private shouldRenderNodeImage(nodeId: string, visibleNodeCount: number) {
 		return (
-			visibleNodeCount <= this.IMAGE_RENDER_THRESHOLD ||
+			visibleNodeCount <= this.getImageRenderThreshold() ||
 			nodeId === this.currentSelectedNodeId ||
 			this.rootNodeIds.includes(nodeId) ||
 			this.searchResultNodeIds.includes(nodeId)
@@ -1225,7 +1525,7 @@ class AppContainer {
 				this.suppressNodeClickUntilMs = Date.now() + 240
 				this.activeNodeToolbeltId = d.id
 				this.cancelNodeHold(false)
-				void this.rerenderGraph()
+				void this.refreshGraphAfterInteraction(d.id, { focusNode: false })
 				return
 			}
 			this.holdAnimationFrameHandle = window.requestAnimationFrame(animate)
@@ -1245,24 +1545,19 @@ class AppContainer {
 			return
 		}
 		const shouldExpand = this.pendingSecondTapNodeId === d.id && this.pendingSecondTapExpiryMs > now
-		const toolbeltNeedsMove = this.activeNodeToolbeltId !== d.id
 		this.activeNodeToolbeltId = d.id
-		this.selectNode(d, { openNoteOnDesktop: true, focusNode: true })
+		this.selectNode(d, { openNoteOnDesktop: true, focusNode: false })
 		if (shouldExpand) {
 			this.clearPendingSecondTap(d.id)
 			if (this.canPanelExpand(d.id)) {
 				this.graphState.markNodeManuallyExpanded(d.id)
-				void this.rerenderGraph().then(() => this.focusOnNode(d.id))
-			} else {
-				void this.rerenderGraph().then(() => this.focusOnNode(d.id))
 			}
+			void this.refreshGraphAfterInteraction(d.id)
 			return
 		}
 		this.pendingSecondTapNodeId = d.id
 		this.pendingSecondTapExpiryMs = now + NODE_SECOND_TAP_WINDOW_MS
-		if (toolbeltNeedsMove) {
-			void this.rerenderGraph().then(() => this.focusOnNode(d.id))
-		}
+		void this.refreshGraphAfterInteraction(d.id)
 	}
 
 	private getNodeActionBubbles(nodeId: string) {
@@ -1978,62 +2273,63 @@ class AppContainer {
 		const boxedNodes: any = {};
 		const visibleNodeCount = nodes.length;
 		const visibleLinkCount = links.length;
-		const shouldRenderDecorations = visibleNodeCount <= this.DECORATION_RENDER_THRESHOLD;
+		const litePaint = this.shouldUseLiteGraphPaint(visibleNodeCount);
+		const allNodesPinned = nodes.length > 0 && nodes.every((node: any) => node.fx != null && node.fy != null);
+		const shouldRenderDecorations = !litePaint && visibleNodeCount <= this.DECORATION_RENDER_THRESHOLD;
 		const renderedLabelCount = nodes.filter((node: any) => this.shouldRenderNodeLabel(node.id, visibleNodeCount)).length;
 		const renderedImageCount = nodes.filter((node: any) => this.shouldRenderNodeImage(node.id, visibleNodeCount)).length;
-		const renderMode = visibleNodeCount > this.LABEL_RENDER_THRESHOLD ? 'compact-rich' : 'full-detail';
+		const renderMode = litePaint
+			? 'lite-paint'
+			: visibleNodeCount > this.getLabelRenderThreshold() ? 'compact-rich' : 'full-detail';
+		svg.classed('ikg-lite-paint', litePaint);
+		this.liteGraphPaint = litePaint;
+		this.renderedVisibleNodeCount = visibleNodeCount;
+		this.simulationSettled = false;
 
 		box_encapsulations.forEach(box => {
 			box.Nodes.forEach((nodeId: string) => {
 				boxedNodes[nodeId] = box;
 			});
 		});
+		this.boxedNodesLookup = boxedNodes;
 
-		// Define the custom force to keep nodes within their assigned boxes
-		function boxConstraintForce(boxedNodesDataset: any[]) {
-			return function(alpha: any) {
+		function boxConstraintForce(boxedNodesDataset: any) {
+			return function(_alpha: any) {
 				nodes.forEach(node => {
 					const box = boxedNodesDataset[node.id];
 					if (box) {
-						// Check if the node is within its assigned box, and adjust if needed
-						let minX = box.x
-						let minY = box.y
-						let maxX = box.x + box.width
-						let maxY = box.y + box.height
-						node.x = Math.max(minX + RADIUS_NODE, Math.min(node.x, maxX - RADIUS_NODE));
-						node.y = Math.max(minY + RADIUS_NODE, Math.min(node.y, maxY - RADIUS_NODE));
+						node.x = Math.max(box.x + RADIUS_NODE, Math.min(node.x, box.x + box.width - RADIUS_NODE));
+						node.y = Math.max(box.y + RADIUS_NODE, Math.min(node.y, box.y + box.height - RADIUS_NODE));
 					}
 				});
 			};
 		}
 
-		// Add the custom box constraint force to the simulation configuration
+		const chargeForce = d3.forceManyBody()
+			.strength(visibleNodeCount > 40 ? -90 : -220)
+			.theta(litePaint ? 0.95 : 0.9)
+			.distanceMax(litePaint ? 280 : 420);
+		const collideForce = d3.forceCollide()
+			.radius((node: any) => this.getNodeCollisionRadius(node.id, visibleNodeCount))
+			.strength(1)
+			.iterations(litePaint ? 1 : 2);
+
 		// bookmark__Simulation Configuration
 		const simulation = d3.forceSimulation(nodes)
-			.force('link', 
+			.force('link',
 				d3.forceLink(links)
-				.distance((link: any) => {
-					const sourceId = typeof link.source === 'string' ? link.source : link.source?.id;
-					const targetId = typeof link.target === 'string' ? link.target : link.target?.id;
-					const touchesToolbeltNode = sourceId === this.activeNodeToolbeltId || targetId === this.activeNodeToolbeltId;
-					if (touchesToolbeltNode) {
-						return visibleNodeCount > 40 ? 135 : 175;
-					}
-					return visibleNodeCount > 40 ? 75 : 100;
-				})
-				.id((d: any) => {
-					return d.id;
-				})
+				.distance(() => visibleNodeCount > 40 ? 75 : 100)
+				.id((d: any) => d.id)
 				.strength(0.1)
 			)
-			// .force('center', d3.forceCenter(width / 2, height / 2)) // this is reason why nodes keep popping far away
-			.force('charge', d3.forceManyBody().strength(visibleNodeCount > 40 ? -120 : -220))
-			.force("collide", d3.forceCollide()
-				.radius((node: any) => this.getNodeCollisionRadius(node.id, visibleNodeCount))
-				.strength(1)
-				.iterations(2))
-			.force("boxConstraint", boxConstraintForce(boxedNodes));
-		simulation.alphaDecay(visibleNodeCount > 40 ? 0.3 : 0.2);
+			.force('charge', chargeForce)
+			.force('collide', collideForce);
+		if (Object.keys(boxedNodes).length > 0) {
+			simulation.force('boxConstraint', boxConstraintForce(boxedNodes));
+		}
+		simulation.alphaDecay(litePaint || visibleNodeCount > 40 ? 0.4 : 0.2);
+		simulation.velocityDecay(litePaint ? 0.55 : 0.4);
+		simulation.stop();
 		this.simulation = simulation;
 		this.renderedNodeLookup = new Map(nodes.map((node: any) => [node.id, node]));
 		this.updateDiagnosticsPanel({
@@ -2046,7 +2342,7 @@ class AppContainer {
 			collapsedNodeCount: this.collapsedNodeIds.length,
 			searchResultCount: this.searchResultNodeIds.length,
 			renderMode,
-			simulationStatus: 'starting',
+			simulationStatus: allNodesPinned ? 'pinned-static' : 'starting',
 			alpha: simulation.alpha(),
 		});
 
@@ -2103,7 +2399,7 @@ class AppContainer {
 			this.cancelNodeHold()
 			if (this.activeNodeToolbeltId) {
 				this.activeNodeToolbeltId = null
-				void this.rerenderGraph()
+				this.syncSelectionAndToolbelt(null)
 			}
 		})
 
@@ -2218,10 +2514,11 @@ class AppContainer {
 			.selectAll('g')
 			.data(nodes)
 			.join('g')
-			.attr('class', 'ikg-node-group')
+			.attr('class', (d: { id: string }) => `ikg-node-group${d.id === this.currentSelectedNodeId ? ' is-selected' : ''}`)
 			.attr('data-box', d => boxedNodes[d.id] ? boxedNodes[d.id].Id : null)
+			.attr('data-node-id', (d: { id: string }) => d.id)
 			// @ts-ignore
-			.call(dragNodeHandler(simulation, this.graphState, () => this.cancelNodeHold()))
+			.call(this.createNodeDragHandler(simulation))
 			.on('pointerdown', (event: any, d: any) => {
 				event.stopPropagation()
 				this.beginNodeHold(event, d, event.currentTarget as SVGGElement)
@@ -2230,6 +2527,14 @@ class AppContainer {
 			.on('pointerleave', () => this.cancelNodeHold())
 			.on('pointercancel', () => this.cancelNodeHold())
 			.on('click', (event: any, d: any) => this.handleNodePrimaryTap(event, d));
+
+		this.graphNodeSelection = node;
+		this.graphLinkSelection = link;
+		this.nodeElementLookup = new Map();
+		node.each((d: { id: string }, index: number, groups: any) => {
+			this.nodeElementLookup.set(d.id, groups[index] as SVGGElement);
+		});
+		this.indexIncidentLinks();
 
 		node.append('circle')
 			.attr('class', 'ikg-node-hold-ring')
@@ -2243,20 +2548,11 @@ class AppContainer {
 			.style('display', 'none')
 			.style('pointer-events', 'none');
 
-		node.filter((d: { id: string }) => this.activeNodeToolbeltId === d.id)
-			.append('circle')
-			.attr('class', 'ikg-node-toolbelt-aura')
-			.attr('r', RADIUS_NODE + 26)
-			.attr('fill', 'rgba(168, 85, 247, 0.08)')
-			.attr('stroke', 'rgba(244, 114, 182, 0.55)')
-			.attr('stroke-width', 2.5)
-			.style('pointer-events', 'none');
-
 		node.append('circle')
+			.attr('class', 'ikg-node-core')
 			.attr('r', RADIUS_NODE)
 			.attr('stroke', (d: { id: any; }) => this.identifyStrokeForNodeCircle(d.id, this.rootNodeIds, this.currentSelectedNodeId, this.searchResultNodeIds))
 			.attr('stroke-width', (d: { id: any; }) => d.id === this.currentSelectedNodeId ? 5 : 3)
-			.attr('filter', 'drop-shadow(0 14px 26px rgba(15, 23, 42, 0.28))')
 			.attr('fill', (d: { id: any; }) =>
 				this.identifyColorForNodeCircle(
 					d.id,
@@ -2265,7 +2561,6 @@ class AppContainer {
 					this.searchResultNodeIds)
 			);
 
-		// Append rectangles below the circles
 		node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
 			.append('rect')
 			.attr('width', WIDTH_NODE_TITLE_BAR + 36)
@@ -2278,7 +2573,6 @@ class AppContainer {
 			.attr('stroke', 'rgba(191, 219, 254, 0.16)')
 			.attr('stroke-width', 1);
 
-		// bookmark__Node Render Face Image (first image within note file)
 		node.filter((d: { id: string; }) => this.shouldRenderNodeImage(d.id, visibleNodeCount))
 			.append('image')
 			.attr('clip-path', 'circle(40px at center)')
@@ -2289,8 +2583,7 @@ class AppContainer {
 			.attr('height', NODE_IMAGE_SIZE)
 			.style('pointer-events', 'none');
 
-		// Append text within the rectangles
-		node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
+		const labelText = node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
 			.append('text')
 			.attr('x', 0)
 			.attr('y', RADIUS_NODE + HEIGHT_NODE_TITLE_BAR / 2 + 10)
@@ -2302,12 +2595,14 @@ class AppContainer {
 			.attr('paint-order', 'stroke')
 			.attr('font-size', visibleNodeCount > 80 ? 9 : 10.5)
 			.attr('font-weight', 450)
-			.attr('letter-spacing', '0')
 			.style('font-family', 'var(--font-interface)')
-			.style('text-rendering', 'geometricPrecision')
-			.style('shape-rendering', 'geometricPrecision')
-			.style('-webkit-font-smoothing', 'antialiased')
 			.text((d: { id: any; }) => d.id.length > 18 ? `${d.id.slice(0, 18)}…` : d.id);
+		if (!litePaint) {
+			labelText
+				.style('text-rendering', 'geometricPrecision')
+				.style('shape-rendering', 'geometricPrecision')
+				.style('-webkit-font-smoothing', 'antialiased');
+		}
 
 		node.append('circle')
 			.attr('cx', -RADIUS_NODE * 0.68)
@@ -2327,80 +2622,34 @@ class AppContainer {
 			.attr('font-weight', 700)
 			.style('pointer-events', 'none')
 			.style('font-family', 'var(--font-interface)')
-			.style('text-rendering', 'geometricPrecision')
 			.text((d: { id: string; }) => this.canNodeExpand(d.id) ? '+' : this.canNodeCollapse(d.id) ? '–' : '•');
 
-		// Append text count-relationships within the rectangle
 		node.filter((d: { id: string; }) => this.shouldRenderNodeLabel(d.id, visibleNodeCount))
 			.append('text')
 			.attr('x', RADIUS_NODE * 0.8)
 			.attr('y', -RADIUS_NODE)
 			.attr('text-anchor', 'middle')
-			.attr('text-color', 'purple')
 			.attr('alignment-baseline', 'middle')
 			.attr('fill', 'rgba(147, 197, 253, 0.88)')
 			.attr('font-size', 10)
 			.attr('font-weight', 600)
-			.text(
-				(d: { id: any; }) => `${this.graphState.getNodeNeighborCount(d.id)}`);
+			.text((d: { id: any; }) => `${this.graphState.getNodeNeighborCount(d.id)}`);
 
-		node.filter((d: { id: string }) => this.activeNodeToolbeltId === d.id)
-			.each((d: any, index: number, groups: any) => {
-				const host = d3.select(groups[index]).append('g').attr('class', 'ikg-node-toolbelt');
-				const actions = this.getNodeActionBubbles(d.id);
-				const bubble = host.selectAll('g')
-					.data(actions)
-					.join('g')
-					.attr('class', 'ikg-node-action-bubble')
-					.attr('transform', (action: any) => {
-						const angle = (action.angle * Math.PI) / 180;
-						const radius = NODE_TOOLBELT_BUBBLE_DISTANCE;
-						return `translate(${Math.cos(angle) * radius},${Math.sin(angle) * radius})`;
-					})
-					.style('cursor', 'pointer')
-					.on('click', (event: any, action: any) => {
-						event.stopPropagation()
-						void this.handleNodeActionBubble(action.key, d.id)
-					});
-
-				bubble.append('circle')
-					.attr('r', 24)
-					.attr('fill', 'rgba(15, 23, 42, 0.92)')
-					.attr('stroke', 'rgba(191, 219, 254, 0.5)')
-					.attr('stroke-width', 1.8)
-					.attr('filter', 'drop-shadow(0 10px 18px rgba(15, 23, 42, 0.32))');
-
-				bubble.append('text')
-					.attr('text-anchor', 'middle')
-					.attr('alignment-baseline', 'middle')
-					.attr('fill', '#fff')
-					.attr('font-size', 16)
-					.style('pointer-events', 'none')
-					.text((action: any) => action.emoji);
-
-				bubble.append('text')
-					.attr('y', 38)
-					.attr('text-anchor', 'middle')
-					.attr('fill', 'rgba(241, 245, 249, 0.92)')
-					.attr('font-size', 9)
-					.attr('font-weight', 600)
-					.style('pointer-events', 'none')
-					.text((action: any) => action.label);
-			});
-
+		if (this.activeNodeToolbeltId) {
+			const toolbeltHost = this.nodeElementLookup.get(this.activeNodeToolbeltId);
+			if (toolbeltHost) {
+				this.attachNodeToolbelt(toolbeltHost, this.activeNodeToolbeltId);
+			}
+		}
 
 		let lastDiagnosticsUpdate = 0;
 		simulation.on('tick', () => {
-			link
-				.attr('x1', (d: { source: { x: any; }; }) => d.source.x)
-				.attr('y1', (d: { source: { y: any; }; }) => d.source.y)
-				.attr('x2', (d: { target: { x: any; }; }) => d.target.x)
-				.attr('y2', (d: { target: { y: any; }; }) => d.target.y);
-			//@ts-ignore
-			node.attr('transform', (d: { x: any; y: any; }) => `translate(${Math.round(d.x ?? 0)},${Math.round(d.y ?? 0)})`);
-
+			this.paintGraphFrame();
+			if (!this.diagnosticsVisible) {
+				return;
+			}
 			const now = Date.now();
-			if (now - lastDiagnosticsUpdate > 200) {
+			if (now - lastDiagnosticsUpdate > 400) {
 				lastDiagnosticsUpdate = now;
 				this.updateDiagnosticsPanel({
 					visibleNodes: visibleNodeCount,
@@ -2419,6 +2668,11 @@ class AppContainer {
 		});
 
 		simulation.on('end', () => {
+			if (this.simulation !== simulation) {
+				return;
+			}
+			this.pinRenderedNodesInPlace();
+			this.settleSimulation('settled');
 			this.updateDiagnosticsPanel({
 				visibleNodes: visibleNodeCount,
 				visibleLinks: visibleLinkCount,
@@ -2434,10 +2688,19 @@ class AppContainer {
 			});
 		});
 
-		window.setTimeout(() => {
-			if (this.simulation === simulation) {
-				simulation.alphaTarget(0);
-				simulation.stop();
+		if (allNodesPinned) {
+			simulation.stop();
+			simulation.tick();
+			this.pinRenderedNodesInPlace();
+			this.settleSimulation('pinned-static');
+		} else {
+			simulation.alpha(1).restart();
+			this.simulationAutoStopHandle = window.setTimeout(() => {
+				if (this.simulation !== simulation) {
+					return;
+				}
+				this.pinRenderedNodesInPlace();
+				this.settleSimulation('auto-stopped');
 				this.updateDiagnosticsPanel({
 					visibleNodes: visibleNodeCount,
 					visibleLinks: visibleLinkCount,
@@ -2451,104 +2714,38 @@ class AppContainer {
 					simulationStatus: 'auto-stopped',
 					alpha: simulation.alpha(),
 				});
-			}
-		}, visibleNodeCount > 40 ? 1200 : 2200);
-
-
-		// bookmark__Node Drag Handler
-		function dragNodeHandler(simulation: any, graphStateRef: GraphState, onDragStart: () => void) {
-			function updateNodePosition(nodeId: string, fx: number, fy: number) {
-				const node = graphStateRef.getNodeById(nodeId);
-				if (node) {
-					node.fx = fx;
-					node.fy = fy;
-				}
-				graphStateRef.updateNodeCoordinates(nodeId, { fx, fy });
-			}
-
-			function dragstarted(event: any, d: any) {
-				onDragStart()
-				if (!event.active) {
-					simulation.alphaTarget(0.3).restart();
-				}
-
-				const box = boxedNodes[d.id];
-				let selectedX = 0
-				let selectedY = 0
-				if (box) {
-					// Constrain x and y based on the box boundaries
-					const minX = box.x;
-					const maxX = box.x + box.width;
-					const minY = box.y;
-					const maxY = box.y + box.height;
-					
-					selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-					selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-				} else {
-					// If node is not in a box, allow free movement
-					selectedX = event.x;
-					selectedY = event.y;
-				}
-				d.fx = selectedX
-				d.fy = selectedY
-				updateNodePosition(d.id, selectedX, selectedY)
-
-			}
-			function dragged(event: any, d: any) {
-				const box = boxedNodes[d.id];
-				let selectedX = 0
-				let selectedY = 0
-				if (box) {
-					// Constrain x and y based on the box boundaries
-					const minX = box.x;
-					const maxX = box.x + box.width;
-					const minY = box.y;
-					const maxY = box.y + box.height;
-					
-					selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-					selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-				} else {
-					// If node is not in a box, allow free movement
-					selectedX = event.x;
-					selectedY = event.y;
-				}
-
-				d.fx = selectedX;
-				d.fy = selectedY;
-				updateNodePosition(d.id, selectedX, selectedY)
-			}
-			function dragended(event: any, d: any) {
-				if (!event.active) simulation.alphaTarget(0);
-
-				let selectedX = 0
-				let selectedY = 0
-				const box = boxedNodes[d.id];
-				if (box) {
-					// Constrain x and y based on the box boundaries
-					const minX = box.x;
-					const maxX = box.x + box.width;
-					const minY = box.y;
-					const maxY = box.y + box.height;
-					
-					selectedX = Math.max(minX + RADIUS_NODE, Math.min(event.x, maxX - RADIUS_NODE));
-					selectedY = Math.max(minY + RADIUS_NODE, Math.min(event.y, maxY - RADIUS_NODE));
-				} else {
-					// If node is not in a box, allow free movement
-					selectedX = event.x;
-					selectedY = event.y;
-				}
-
-				d.fx = selectedX;
-				d.fy = selectedY;
-				updateNodePosition(d.id, selectedX, selectedY)
-			}
-			return d3.drag()
-				.on('start', dragstarted)
-				.on('drag', dragged)
-				.on('end', dragended);
+			}, litePaint ? 800 : (visibleNodeCount > 40 ? 1200 : 2200));
 		}
 
 		return svg;
+	}
+
+	private createNodeDragHandler(simulation: any) {
+		const applyDragPosition = (event: any, d: any) => {
+			const next = this.constrainDragPosition(d.id, event.x, event.y);
+			this.applyKinematicNodeMove(d, next.x, next.y);
+		};
+
+		return d3.drag()
+			.clickDistance(12)
+			.on('start', (event: any, d: any) => {
+				this.cancelNodeHold();
+				this.setGraphDragging(true, d.id);
+				applyDragPosition(event, d);
+				if (!this.simulationSettled && !event.active) {
+					simulation.alphaTarget(0.18).restart();
+				}
+			})
+			.on('drag', (event: any, d: any) => {
+				applyDragPosition(event, d);
+			})
+			.on('end', (event: any, d: any) => {
+				applyDragPosition(event, d);
+				this.setGraphDragging(false);
+				if (!this.simulationSettled && !event.active) {
+					simulation.alphaTarget(0);
+				}
+			});
 	}
 
 	// section 2 ---------------------------- Graph Nodes/Links Renders and Behaviors
@@ -2560,8 +2757,11 @@ class AppContainer {
 		if (nodeData && this.svg && this.zoomBehavior) {
 			const x = nodeData.fx ?? nodeData.x;
 			const y = nodeData.fy ?? nodeData.y;
-			
-			this.svg.transition().duration(300).call(
+			if (x == null || y == null) {
+				return;
+			}
+			const duration = this.isCoarsePointerDevice() ? 0 : 180;
+			this.svg.transition().duration(duration).call(
 				this.zoomBehavior.transform,
 				d3.zoomIdentity
 					.translate(width / 2, height / 2)
@@ -2694,9 +2894,18 @@ class AppContainer {
 
 	// section 4 ---------------------------- Tools and Utils
 	uniqueJsonArray(arr: any[]) {
-		const uniqueSet = new Set(arr.map(obj => JSON.stringify(obj)));
-		return Array.from(uniqueSet).map(str => JSON.parse(str));
-	};
+		const seen = new Set<string>();
+		const unique: any[] = [];
+		for (const obj of arr) {
+			const key = `${obj?.source ?? ''}\0${obj?.target ?? ''}\0${obj?.zIndex ?? ''}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			unique.push(obj);
+		}
+		return unique;
+	}
 
 
 	// section 4 ---------------------------- Tools and Utils
