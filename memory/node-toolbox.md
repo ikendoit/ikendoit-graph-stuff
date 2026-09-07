@@ -21,6 +21,8 @@ Bubbles from `getNodeActionBubbles()` / `handleNodeActionBubble()`:
 | `collapse-others` | 🍂 | Collapse every other manually expanded node |
 | `save-layout` | 💾 | Write `Coordinate-Graph-Render(x/y)` for **all visible** nodes |
 | `show-markdown` | 📜 | Open the note in a markdown leaf (“Loop note”) |
+| `new-neighbor` | 🌱 | Create a new note next to this one, write a bidirectional relationship, and drop the neighbor on the graph |
+| `link-nodes` | 🔗 | Tap a second node, then save a short sentence onto both notes |
 | `show-map` | 🗺️ | Switch the whole view to Map mode |
 
 Collision: while the toolbox is open, that node's collide radius and incident link distance increase so bubbles are not buried.
@@ -29,7 +31,7 @@ The + / – badge on the node itself is a **status light**, not a separate contr
 
 ## Why Trung said it “just show/unshow nodes”
 
-The only *graph-structure* tools are expand/collapse. Save / open note / map are jumps, not a toolbox of node operations. The intended identity is: **this node is an object; the bubbles are its verbs.**
+Expand/collapse stays, and **Link** / **New note** now change the vault graph. Save / open note / map remain jumps. The intended identity is: **this node is an object; the bubbles are its verbs.**
 
 Show/unshow should remain one verb, not the whole product.
 
@@ -54,10 +56,16 @@ Design constraints:
 6. **Copy wikilink / copy title**
 7. **Mark `#ROOT_NODE` in the file** (persist the root flag, not just session state)
 
+### Shipped relationship verbs (2026-09-07)
+
+- **Link** (`link-nodes`): pick another visible node, type or chip-fill “A is a friend of B”, append the same sentence plus `[[wikilink]]` to both notes in a managed `IKG_RELATIONSHIPS` block (same padding style as map pins).
+- **New note** (`new-neighbor`): name the neighbor, same annotation chips, create `{folder}/{Name}.md` beside the source, write the relationship both ways, pin the new node near the source. Existing titles become a link instead of a second file.
+- Escape / Cancel aborts. After save, the new or target node keeps the toolbox so the user can drag, Save layout, Map, or Loop note.
+
 ### Medium-term (matches TODOs in `main.ts`)
 
 - Restore **node inspector** (`DisplayPanel` + `.ikg-node-panel` CSS). Toolbox “inspect” bubble should build the panel instead of the current teardown.
-- **Relationship tools**: labeled edges, z-index visibility, link click (explicitly unimplemented).
+- **Richer relationship tools**: labeled edges in the SVG, z-index visibility, link click (still unimplemented).
 - **Tag / filter from a node** — search is global; a bubble could set the search to that node's tags.
 - Custom backlink label syntax (TODO in file header).
 

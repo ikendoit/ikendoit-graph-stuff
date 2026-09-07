@@ -45,7 +45,7 @@ Harmonization protocol: `memory/openclaw-harmonization.md`.
 
 - Owner: Trung (`ikendoit`). Student; prefers working directly in code.
 - Plugin id / GitHub: `ikendoit/ikendoit-graph-stuff`.
-- Current version: `1.0.8`.
+- Current version: `1.0.12`.
 - Preferred delivery: GitHub release + **BRAT** on every device.
 - Keep `main.js` committed. BRAT installs from GitHub repo/release contents.
 - Keep runtime files at repo root: `main.js`, `manifest.json`, `styles.css`, `versions.json`.
@@ -59,7 +59,7 @@ Two live modes in one split-leaf view:
 - **Graph mode**: D3 force graph of notes, avatars, search, hold-to-reveal node toolbelt.
 - **Map mode**: Leaflet world map of pins stored in notes, address search, draft pin, save back into markdown.
 
-The node **toolbelt** (hold a node ~3.6s, or tap it) is the intended per-node command surface. Today it is still mostly visibility plus a few jumps (expand/collapse, collapse others, save layout, open note, switch to map). Growing that toolbox is the main product direction.
+The node **toolbelt** (hold a node ~3.6s, or tap it) is the intended per-node command surface: expand/collapse, **link two notes**, **create a neighbor note**, save layout, open note, switch to map.
 
 ## Do / don't
 
