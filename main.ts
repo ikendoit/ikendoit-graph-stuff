@@ -19,12 +19,23 @@ import {
     defaultAvatar,
 } from 'utils/constants';
 import DisplayPanel from 'utils/canvas_panel_display'
-import { GraphState, GraphNode, NodeMapPosition } from 'utils/graph_state'
+import { GraphState, GraphNode, NodeMapPosition, NodeRelationship } from 'utils/graph_state'
 
 const box_encapsulations: any[] = [];
 const MAP_POSITIONS_BLOCK_START = '<!-- IKG_MAP_POSITIONS_START -->';
 const MAP_POSITIONS_BLOCK_END = '<!-- IKG_MAP_POSITIONS_END -->';
 const MAP_POSITION_COMMENT_PREFIX = 'IKG_MAP_POSITION';
+const RELATIONSHIPS_BLOCK_START = '<!-- IKG_RELATIONSHIPS_START -->';
+const RELATIONSHIPS_BLOCK_END = '<!-- IKG_RELATIONSHIPS_END -->';
+const RELATIONSHIP_COMMENT_PREFIX = 'IKG_RELATIONSHIP';
+const RELATION_CHIPS = [
+	{ key: 'friend', label: 'friend of', template: '{A} is a friend of {B}' },
+	{ key: 'knows', label: 'knows', template: '{A} knows {B}' },
+	{ key: 'works', label: 'works with', template: '{A} works with {B}' },
+	{ key: 'near', label: 'lives near', template: '{A} lives near {B}' },
+	{ key: 'family', label: 'family of', template: '{A} is family of {B}' },
+	{ key: 'related', label: 'related to', template: '{A} is related to {B}' },
+] as const;
 const NODE_HOLD_REVEAL_MS = 3600;
 const NODE_SECOND_TAP_WINDOW_MS = 3600;
 const NODE_TOOLBELT_BUBBLE_DISTANCE = RADIUS_NODE + 82;
@@ -43,6 +54,14 @@ const SYNC_RELEASE_MANIFEST_PATH = `${SYNC_RELEASE_PLUGIN_DIR}/release.json`;
 const SYNC_RELEASE_RUNTIME_FILES = ['main.js', 'manifest.json', 'styles.css', 'versions.json'] as const;
 
 type AppMode = 'graph' | 'map';
+type LinkWorkflowMode = 'picking-target' | 'composing-link' | 'composing-new';
+
+interface LinkWorkflowState {
+	mode: LinkWorkflowMode;
+	sourceNodeId: string;
+	targetNodeId?: string;
+	createdNode?: boolean;
+}
 
 interface NodeLocationRecord {
 	node: GraphNode;
@@ -270,6 +289,10 @@ export default class InteractiveGraphPlugin extends Plugin {
 
 		this.parsedFileCache.set(cacheKey, { mtime: fileMtime, data: parsed });
 		return parsed;
+	}
+
+	invalidateParsedFile(filePath: string) {
+		this.parsedFileCache.delete(filePath);
 	}
 
 	// bookmark__InteractiveGraphPlugin random Static-utilities
@@ -676,6 +699,15 @@ class AppContainer {
 	suppressNodeClickUntilMs = 0;
 	pendingSecondTapNodeId: string | null = null;
 	pendingSecondTapExpiryMs = 0;
+	linkWorkflow: LinkWorkflowState | null = null;
+	linkPickBannerEl: HTMLElement | null = null;
+	linkComposerEl: HTMLElement | null = null;
+	linkComposerNameInputEl: HTMLInputElement | null = null;
+	linkComposerAnnotationInputEl: HTMLTextAreaElement | null = null;
+	linkComposerHintEl: HTMLElement | null = null;
+	linkComposerChipKey: string = RELATION_CHIPS[0].key;
+	linkComposerAnnotationDirty = false;
+	linkWorkflowKeyHandler: ((event: KeyboardEvent) => void) | null = null;
 	currentMode: AppMode = 'graph';
 	mapModeRootEl: HTMLElement | null = null;
 	mapModeCanvasEl: HTMLElement | null = null;
@@ -888,6 +920,10 @@ class AppContainer {
 		if (this.controlBarEl?.isConnected) {
 			const controlBarRect = this.controlBarEl.getBoundingClientRect();
 			topOffset = Math.max(topOffset, Math.ceil(controlBarRect.bottom - contentRect.top + defaultEdgeInset));
+		}
+		if (this.linkPickBannerEl?.isConnected) {
+			const bannerRect = this.linkPickBannerEl.getBoundingClientRect();
+			topOffset = Math.max(topOffset, Math.ceil(bannerRect.bottom - contentRect.top + defaultEdgeInset));
 		}
 
 		contentEl.style.setProperty('--ikg-control-bar-offset', `${topOffset}px`);
@@ -1102,6 +1138,7 @@ class AppContainer {
 		}
 		this.currentMode = mode;
 		if (mode === 'map') {
+			this.cancelLinkWorkflow({ silent: true });
 			this.queueMapAutoFrame(this.currentSelectedNodeId);
 		}
 		this.refreshModeButtons();
@@ -1485,7 +1522,9 @@ class AppContainer {
 			core.setAttribute('stroke-width', nodeId === this.currentSelectedNodeId ? '5' : '3');
 			element.classList.toggle('is-selected', nodeId === this.currentSelectedNodeId);
 			element.classList.toggle('is-toolbelt-host', nodeId === this.activeNodeToolbeltId);
+			element.classList.toggle('is-link-source', this.linkWorkflow?.sourceNodeId === nodeId);
 		});
+		this.svg?.classed?.('ikg-is-picking-link', this.linkWorkflow?.mode === 'picking-target');
 	}
 
 	private clearRenderedNodeToolbelts() {
@@ -1593,6 +1632,12 @@ class AppContainer {
 		this.searchInputEl = null;
 		this.graphModeButtonEl = null;
 		this.mapModeButtonEl = null;
+		this.cancelLinkWorkflow({ silent: true });
+		this.linkPickBannerEl = null;
+		this.linkComposerEl = null;
+		this.linkComposerNameInputEl = null;
+		this.linkComposerAnnotationInputEl = null;
+		this.linkComposerHintEl = null;
 		this.cancelNodeHold();
 		this.clearPendingSecondTap();
 		this.activeNodeToolbeltId = this.currentSelectedNodeId;
@@ -1743,6 +1788,9 @@ class AppContainer {
 	}
 
 	private beginNodeHold(event: any, d: any, nodeElement: SVGGElement) {
+		if (this.linkWorkflow?.mode === 'picking-target') {
+			return
+		}
 		if (event.button != null && event.button !== 0) {
 			return
 		}
@@ -1787,6 +1835,10 @@ class AppContainer {
 	private handleNodePrimaryTap(event: any, d: any) {
 		event.stopPropagation()
 		this.cancelNodeHold()
+		if (this.linkWorkflow?.mode === 'picking-target') {
+			this.completeLinkTargetPick(d.id)
+			return
+		}
 		const now = Date.now()
 		if (now < this.suppressNodeClickUntilMs) {
 			return
@@ -1816,28 +1868,40 @@ class AppContainer {
 				angle: -90,
 			},
 			{
+				key: 'new-neighbor',
+				emoji: '🌱',
+				label: 'New note',
+				angle: -39,
+			},
+			{
+				key: 'link-nodes',
+				emoji: '🔗',
+				label: 'Link',
+				angle: 13,
+			},
+			{
 				key: 'collapse-others',
 				emoji: '🍂',
 				label: 'Collapse others',
-				angle: -20,
+				angle: 64,
 			},
 			{
 				key: 'save-layout',
 				emoji: '💾',
 				label: 'Save',
-				angle: 45,
+				angle: 116,
 			},
 			{
 				key: 'show-markdown',
 				emoji: '📜',
 				label: 'Loop note',
-				angle: 135,
+				angle: 167,
 			},
 			{
 				key: 'show-map',
 				emoji: '🗺️',
 				label: 'Map',
-				angle: 205,
+				angle: 218,
 			},
 		]
 	}
@@ -1876,6 +1940,448 @@ class AppContainer {
 			await this.setAppMode('map')
 			return
 		}
+		if (actionKey === 'link-nodes') {
+			this.startLinkTargetPick(nodeId)
+			return
+		}
+		if (actionKey === 'new-neighbor') {
+			this.openNewNeighborComposer(nodeId)
+			return
+		}
+	}
+
+	private startLinkTargetPick(sourceNodeId: string) {
+		const source = this.graphState.getNodeById(sourceNodeId);
+		if (!source) {
+			return;
+		}
+		this.linkWorkflow = { mode: 'picking-target', sourceNodeId };
+		this.activeNodeToolbeltId = null;
+		this.clearPendingSecondTap();
+		this.syncSelectionAndToolbelt(null);
+		this.ensureLinkWorkflowKeyHandler();
+		this.renderLinkPickBanner(`Tap another node to link with ${source.source}.`);
+		this.destroyLinkComposer();
+		this.refreshRenderedNodePaints();
+		this.scheduleOverlayLayoutSync();
+		new Notice(`Tap the note that belongs with ${source.source}.`);
+	}
+
+	private completeLinkTargetPick(targetNodeId: string) {
+		const sourceNodeId = this.linkWorkflow?.sourceNodeId;
+		if (!sourceNodeId) {
+			return;
+		}
+		if (targetNodeId === sourceNodeId) {
+			new Notice('Pick a different node. Linking a note to itself does not create a neighbor.');
+			return;
+		}
+		const target = this.graphState.getNodeById(targetNodeId);
+		if (!target) {
+			new Notice('That node is not a note the graph can link yet.');
+			return;
+		}
+		this.graphState.setCurrentSelectedNodeId(targetNodeId);
+		this.openLinkComposer(sourceNodeId, targetNodeId, false);
+	}
+
+	private openNewNeighborComposer(sourceNodeId: string) {
+		const source = this.graphState.getNodeById(sourceNodeId);
+		if (!source) {
+			return;
+		}
+		this.linkComposerAnnotationDirty = false;
+		this.linkWorkflow = { mode: 'composing-new', sourceNodeId, createdNode: true };
+		this.activeNodeToolbeltId = sourceNodeId;
+		this.clearPendingSecondTap();
+		this.ensureLinkWorkflowKeyHandler();
+		this.destroyLinkPickBanner();
+		this.renderLinkComposer();
+		this.refreshRenderedNodePaints();
+		this.scheduleOverlayLayoutSync();
+		window.setTimeout(() => this.linkComposerNameInputEl?.focus(), 30);
+	}
+
+	private openLinkComposer(sourceNodeId: string, targetNodeId: string, createdNode: boolean) {
+		this.linkComposerAnnotationDirty = false;
+		this.linkWorkflow = { mode: 'composing-link', sourceNodeId, targetNodeId, createdNode };
+		this.activeNodeToolbeltId = sourceNodeId;
+		this.ensureLinkWorkflowKeyHandler();
+		this.destroyLinkPickBanner();
+		this.renderLinkComposer();
+		this.refreshRenderedNodePaints();
+		this.scheduleOverlayLayoutSync();
+		window.setTimeout(() => this.linkComposerAnnotationInputEl?.focus(), 30);
+	}
+
+	private cancelLinkWorkflow(options: { silent?: boolean } = {}) {
+		if (this.linkWorkflowKeyHandler) {
+			window.removeEventListener('keydown', this.linkWorkflowKeyHandler);
+			this.linkWorkflowKeyHandler = null;
+		}
+		this.destroyLinkPickBanner();
+		this.destroyLinkComposer();
+		this.linkWorkflow = null;
+		this.linkComposerChipKey = RELATION_CHIPS[0].key;
+		this.linkComposerAnnotationDirty = false;
+		this.svg?.classed?.('ikg-is-picking-link', false);
+		if (!options.silent) {
+			this.refreshRenderedNodePaints();
+			this.scheduleOverlayLayoutSync();
+		}
+	}
+
+	private ensureLinkWorkflowKeyHandler() {
+		if (this.linkWorkflowKeyHandler) {
+			return;
+		}
+		this.linkWorkflowKeyHandler = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') {
+				event.preventDefault();
+				this.cancelLinkWorkflow();
+			}
+		};
+		window.addEventListener('keydown', this.linkWorkflowKeyHandler);
+	}
+
+	private destroyLinkPickBanner() {
+		this.linkPickBannerEl?.remove();
+		this.linkPickBannerEl = null;
+	}
+
+	private destroyLinkComposer() {
+		this.linkComposerEl?.remove();
+		this.linkComposerEl = null;
+		this.linkComposerNameInputEl = null;
+		this.linkComposerAnnotationInputEl = null;
+		this.linkComposerHintEl = null;
+	}
+
+	private renderLinkPickBanner(message: string) {
+		const contentEl = this.graphContainerPanel.view.containerEl;
+		this.destroyLinkPickBanner();
+		const banner = contentEl.createDiv({ cls: 'ikg-link-banner' });
+		banner.createDiv({ cls: 'ikg-link-banner__copy', text: message });
+		const cancel = banner.createEl('button', { text: 'Cancel', cls: 'ikg-link-banner__cancel' });
+		cancel.addEventListener('click', (event) => {
+			event.preventDefault();
+			this.cancelLinkWorkflow();
+		});
+		this.linkPickBannerEl = banner;
+		if (this.layoutObserver && banner.isConnected) {
+			this.layoutObserver.observe(banner);
+		}
+	}
+
+	private displayNodeTitle(nodeId: string) {
+		const parts = nodeId.split('/').filter(Boolean);
+		return parts[parts.length - 1] || nodeId;
+	}
+
+	private getLinkWorkflowNames() {
+		const source = this.linkWorkflow ? this.graphState.getNodeById(this.linkWorkflow.sourceNodeId) : null;
+		const sourceName = source ? this.displayNodeTitle(source.source) : 'this note';
+		let targetName = this.linkWorkflow?.targetNodeId
+			? this.displayNodeTitle(this.graphState.getNodeById(this.linkWorkflow.targetNodeId)?.source ?? this.linkWorkflow.targetNodeId)
+			: '';
+		if (this.linkWorkflow?.mode === 'composing-new') {
+			targetName = this.sanitizeNoteTitle(this.linkComposerNameInputEl?.value ?? '');
+		}
+		return { sourceName, targetName };
+	}
+
+	private buildRelationshipAnnotation(sourceName: string, targetName: string, raw = '') {
+		const fallbackTarget = targetName || 'this new note';
+		const typed = raw.replace(/-->/g, ' ').replace(/\s+/g, ' ').trim();
+		if (typed) {
+			return typed;
+		}
+		const chip = RELATION_CHIPS.find((item) => item.key === this.linkComposerChipKey) ?? RELATION_CHIPS[0];
+		return chip.template.replace('{A}', sourceName).replace('{B}', fallbackTarget);
+	}
+
+	private refreshLinkComposerPreview() {
+		if (!this.linkComposerAnnotationInputEl) {
+			return;
+		}
+		const { sourceName, targetName } = this.getLinkWorkflowNames();
+		if (!this.linkComposerAnnotationDirty) {
+			this.linkComposerAnnotationInputEl.value = this.buildRelationshipAnnotation(sourceName, targetName);
+		}
+		if (this.linkComposerHintEl && this.linkWorkflow?.mode === 'composing-new') {
+			const existingId = this.graphState.findNodeIdByTitle(targetName);
+			this.linkComposerHintEl.setText(
+				existingId
+					? `${existingId} already exists. Save will link that note instead of making a second file.`
+					: targetName
+						? `Creates ${targetName}.md next to the original note, then draws the new neighbor on the graph.`
+						: 'Give the new neighbor a short name. You can add a photo and map pin after it appears.'
+			);
+		}
+	}
+
+	private renderLinkComposer() {
+		const contentEl = this.graphContainerPanel.view.containerEl;
+		const workflow = this.linkWorkflow;
+		if (!workflow) {
+			return;
+		}
+		this.destroyLinkComposer();
+		const { sourceName, targetName } = this.getLinkWorkflowNames();
+		const creating = workflow.mode === 'composing-new';
+		const card = contentEl.createDiv({ cls: 'ikg-link-composer' });
+		card.createDiv({ cls: 'ikg-link-composer__eyebrow', text: creating ? 'New neighbor note' : 'Link two notes' });
+		card.createDiv({
+			cls: 'ikg-link-composer__title',
+			text: creating ? `Grow a neighbor from ${sourceName}` : `${sourceName} ↔ ${targetName}`,
+		});
+		card.createDiv({
+			cls: 'ikg-link-composer__copy',
+			text: creating
+				? 'Name the person or idea, tap a phrase, then tweak the sentence. Both notes get the same line.'
+				: 'Pick a phrase or type your own. The same sentence is appended to both notes.',
+		});
+
+		if (creating) {
+			const nameLabel = card.createEl('label', { cls: 'ikg-link-composer__field' });
+			nameLabel.createSpan({ text: 'New note name' });
+			const nameInput = nameLabel.createEl('input', {
+				type: 'text',
+				placeholder: 'Sam, Bakery on 5th, Tuesday club…',
+			});
+			nameInput.addEventListener('input', () => this.refreshLinkComposerPreview());
+			nameInput.addEventListener('keydown', (event: KeyboardEvent) => {
+				if (event.key === 'Enter') {
+					event.preventDefault();
+					void this.submitLinkComposer();
+				}
+			});
+			this.linkComposerNameInputEl = nameInput;
+		}
+
+		const chips = card.createDiv({ cls: 'ikg-link-composer__chips' });
+		for (const chip of RELATION_CHIPS) {
+			const button = chips.createEl('button', {
+				cls: 'ikg-link-composer__chip',
+				text: chip.label,
+				attr: { type: 'button' },
+			});
+			button.classList.toggle('is-active', chip.key === this.linkComposerChipKey);
+			button.addEventListener('click', () => {
+				this.linkComposerChipKey = chip.key;
+				this.linkComposerAnnotationDirty = false;
+				chips.querySelectorAll('.ikg-link-composer__chip').forEach((el) => el.classList.remove('is-active'));
+				button.classList.add('is-active');
+				this.refreshLinkComposerPreview();
+			});
+		}
+
+		const annotationLabel = card.createEl('label', { cls: 'ikg-link-composer__field' });
+		annotationLabel.createSpan({ text: 'Sentence saved on both notes' });
+		const annotationInput = annotationLabel.createEl('textarea');
+		annotationInput.rows = 2;
+		annotationInput.placeholder = this.buildRelationshipAnnotation(sourceName, targetName || 'this new note');
+		annotationInput.value = this.buildRelationshipAnnotation(sourceName, targetName || 'this new note');
+		annotationInput.addEventListener('input', () => {
+			this.linkComposerAnnotationDirty = true;
+		});
+		this.linkComposerAnnotationInputEl = annotationInput;
+
+		const hint = card.createDiv({ cls: 'ikg-link-composer__hint' });
+		this.linkComposerHintEl = hint;
+		if (!creating) {
+			hint.setText('After save, expand to see the new edge. Drag, Map, and Loop note stay on the toolbelt.');
+		}
+
+		const actions = card.createDiv({ cls: 'ikg-link-composer__actions' });
+		const cancel = actions.createEl('button', { text: 'Cancel', attr: { type: 'button' } });
+		cancel.addEventListener('click', () => this.cancelLinkWorkflow());
+		const save = actions.createEl('button', {
+			text: creating ? 'Create neighbor' : 'Save link',
+			cls: 'is-primary',
+			attr: { type: 'button' },
+		});
+		save.addEventListener('click', () => {
+			void this.submitLinkComposer();
+		});
+
+		card.addEventListener('pointerdown', (event) => event.stopPropagation());
+		card.addEventListener('click', (event) => event.stopPropagation());
+		this.linkComposerEl = card;
+		this.refreshLinkComposerPreview();
+	}
+
+	private sanitizeNoteTitle(raw: string) {
+		return raw
+			.replace(/[\\/:*?"<>|#^[\]]/g, ' ')
+			.replace(/-->/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim();
+	}
+
+	private resolveNotePathForTitle(sourceFilePath: string, title: string) {
+		const lastSlash = sourceFilePath.lastIndexOf('/');
+		const folder = lastSlash >= 0 ? sourceFilePath.slice(0, lastSlash + 1) : '';
+		return normalizePath(`${folder}${title}.md`);
+	}
+
+	private seedNeighborCoordinates(sourceNodeId: string) {
+		const source = this.graphState.getNodeById(sourceNodeId);
+		const origin = this.renderedNodeLookup.get(sourceNodeId);
+		const ox = origin?.fx ?? origin?.x ?? source?.fx ?? source?.x ?? SVG_WIDTH / 2;
+		const oy = origin?.fy ?? origin?.y ?? source?.fy ?? source?.y ?? SVG_HEIGHT / 2;
+		const neighbors = this.graphState.getNodeNeighborCount(sourceNodeId);
+		const angle = -Math.PI / 2 + neighbors * 0.7;
+		return {
+			fx: ox + Math.cos(angle) * 168,
+			fy: oy + Math.sin(angle) * 168,
+		};
+	}
+
+	private async submitLinkComposer() {
+		const workflow = this.linkWorkflow;
+		if (!workflow) {
+			return;
+		}
+		const source = this.graphState.getNodeById(workflow.sourceNodeId);
+		if (!source?.nodeFilePath) {
+			new Notice('Could not find the starting note.');
+			return;
+		}
+
+		if (workflow.mode === 'composing-new') {
+			const title = this.sanitizeNoteTitle(this.linkComposerNameInputEl?.value ?? '');
+			if (!title) {
+				new Notice('Type a short name for the new note first.');
+				this.linkComposerNameInputEl?.focus();
+				return;
+			}
+			const existingId = this.graphState.findNodeIdByTitle(title);
+			if (existingId) {
+				this.openLinkComposer(workflow.sourceNodeId, existingId, false);
+				new Notice(`${existingId} already exists, so this will just add the relationship.`);
+				return;
+			}
+			await this.createNeighborNoteAndLink(source, title);
+			return;
+		}
+
+		if (!workflow.targetNodeId) {
+			new Notice('Pick the other node first.');
+			return;
+		}
+		const target = this.graphState.getNodeById(workflow.targetNodeId);
+		if (!target?.nodeFilePath) {
+			new Notice('Could not find the other note.');
+			return;
+		}
+		const annotation = this.buildRelationshipAnnotation(
+			source.source,
+			target.source,
+			this.linkComposerAnnotationInputEl?.value ?? ''
+		);
+		await this.persistBidirectionalRelationship(source, target, annotation);
+		this.graphState.markNodeManuallyExpanded(source.source);
+		this.graphState.setCurrentSelectedNodeId(target.source);
+		this.activeNodeToolbeltId = target.source;
+		this.cancelLinkWorkflow({ silent: true });
+		await this.rerenderGraph();
+		this.focusOnNode(target.source);
+		new Notice(`Linked ${source.source} and ${target.source}.`);
+	}
+
+	private async createNeighborNoteAndLink(source: GraphNode, title: string) {
+		const vault = this.parentAppContainer.vault;
+		const path = this.resolveNotePathForTitle(source.nodeFilePath, title);
+		if (vault.getAbstractFileByPath(path)) {
+			const existingId = InteractiveGraphPlugin.cleanNodeFileTextName(path);
+			const existing = this.graphState.getNodeById(existingId);
+			if (existing) {
+				this.openLinkComposer(source.source, existing.source, false);
+				new Notice('That file is already in the vault. Save to link it.');
+				return;
+			}
+			new Notice(`A file already exists at ${path}.`);
+			return;
+		}
+
+		const coords = this.seedNeighborCoordinates(source.source);
+		const annotation = this.buildRelationshipAnnotation(
+			source.source,
+			title,
+			this.linkComposerAnnotationInputEl?.value ?? ''
+		);
+		const created = await vault.create(path, `# ${title}\n`);
+		if (!(created instanceof TFile)) {
+			new Notice('Obsidian could not create that note.');
+			return;
+		}
+
+		const nodeId = InteractiveGraphPlugin.cleanNodeFileTextName(path);
+		const newNode: GraphNode = {
+			source: nodeId,
+			nodeFilePath: path,
+			tags: [],
+			description: `# ${title}\n`,
+			mapPositions: [],
+			fx: coords.fx,
+			fy: coords.fy,
+			image: defaultAvatar,
+			imageCandidates: [],
+		};
+		this.graphState.registerNode(newNode);
+		await this.persistBidirectionalRelationship(source, newNode, annotation, coords);
+		this.graphState.markNodeManuallyExpanded(source.source);
+		this.graphState.setCurrentSelectedNodeId(nodeId);
+		this.activeNodeToolbeltId = nodeId;
+		this.cancelLinkWorkflow({ silent: true });
+		await this.rerenderGraph();
+		this.focusOnNode(nodeId);
+		new Notice(`Created ${title}. Drag it into place, then Save. Map and Loop note are on the bubbles.`);
+	}
+
+	private async persistBidirectionalRelationship(
+		source: GraphNode,
+		target: GraphNode,
+		annotation: string,
+		newNodeCoords?: { fx: number; fy: number }
+	) {
+		const createdAt = new Date().toISOString();
+		const sourceRel: NodeRelationship = {
+			id: `rel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+			peer: target.source,
+			annotation,
+			createdAt,
+		};
+		const targetRel: NodeRelationship = {
+			id: `rel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+			peer: source.source,
+			annotation,
+			createdAt,
+		};
+		await this.appendRelationshipToNote(source, sourceRel);
+		await this.appendRelationshipToNote(target, targetRel, newNodeCoords);
+		this.graphState.registerLink({ source: source.source, target: target.source, zIndex: 1 });
+	}
+
+	private async appendRelationshipToNote(
+		node: GraphNode,
+		relationship: NodeRelationship,
+		coords?: { fx: number; fy: number }
+	) {
+		const file = this.parentAppContainer.vault.getAbstractFileByPath(node.nodeFilePath);
+		if (!(file instanceof TFile)) {
+			throw new Error(`Missing note file for ${node.source}`);
+		}
+		const existingContent = await this.parentAppContainer.vault.read(file);
+		const existing = this.extractRelationshipsFromContent(existingContent);
+		let nextContent = this.upsertManagedRelationshipsBlock(existingContent, [...existing, relationship]);
+		if (coords && !/Coordinate-Graph-Render\(/.test(nextContent)) {
+			nextContent = `${nextContent.trimEnd()}\nCoordinate-Graph-Render(${coords.fx}/${coords.fy})\n`;
+		}
+		await this.parentAppContainer.vault.modify(file, nextContent);
+		this.graphPlugin.invalidateParsedFile(node.nodeFilePath);
+		await this.refreshNodeContentFromDisk(node.source, node.nodeFilePath);
 	}
 
 	private async saveVisibleNodeLayout() {
@@ -2638,6 +3144,9 @@ class AppContainer {
 			if (event.target !== svg.node()) {
 				return
 			}
+			if (this.linkWorkflow?.mode === 'picking-target') {
+				return
+			}
 			this.cancelNodeHold()
 			if (this.activeNodeToolbeltId) {
 				this.activeNodeToolbeltId = null
@@ -2775,6 +3284,7 @@ class AppContainer {
 		this.captureGraphElementLookups(node);
 		this.indexIncidentLinks();
 		this.paintGraphFrame(true);
+		this.refreshRenderedNodePaints();
 
 		if (this.activeNodeToolbeltId) {
 			const toolbeltHost = this.nodeElementLookup.get(this.activeNodeToolbeltId);
@@ -3431,6 +3941,63 @@ class AppContainer {
 	private upsertManagedMapPositionsBlock(content: string, mapPositions: NodeMapPosition[]) {
 		const nextBlock = this.buildManagedMapPositionsBlock(mapPositions);
 		const blockRegex = /\n*<!-- IKG_MAP_POSITIONS_START -->[\s\S]*?<!-- IKG_MAP_POSITIONS_END -->\n*/g;
+		const stripped = content.replace(blockRegex, '').trimEnd();
+		if (!nextBlock) {
+			return stripped;
+		}
+		return stripped.length > 0 ? `${stripped}\n\n${nextBlock}\n` : `${nextBlock}\n`;
+	}
+
+	private extractRelationshipsFromContent(content: string): NodeRelationship[] {
+		const relationships: NodeRelationship[] = [];
+		const regex = /<!--\s*IKG_RELATIONSHIP\s+({[\s\S]*?})\s*-->/g;
+		let match: RegExpExecArray | null;
+		while ((match = regex.exec(content)) !== null) {
+			try {
+				const parsed = JSON.parse(match[1]);
+				if (!parsed?.id || !parsed?.peer || !parsed?.annotation) {
+					continue;
+				}
+				relationships.push({
+					id: String(parsed.id),
+					peer: String(parsed.peer),
+					annotation: String(parsed.annotation),
+					createdAt: parsed.createdAt ? String(parsed.createdAt) : undefined,
+				});
+			} catch (error) {
+				console.warn('Failed to parse saved relationship metadata', error);
+			}
+		}
+		return relationships;
+	}
+
+	private buildManagedRelationshipsBlock(relationships: NodeRelationship[]) {
+		if (relationships.length === 0) {
+			return '';
+		}
+		const lines = relationships.map((relationship) => {
+			const peer = this.sanitizeMarkdownLinkLabel(relationship.peer) || relationship.peer;
+			const annotation = relationship.annotation.replace(/-->/g, ' ').replace(/\s+/g, ' ').trim();
+			const metadata = JSON.stringify({
+				id: relationship.id,
+				peer: relationship.peer,
+				annotation,
+				createdAt: relationship.createdAt,
+			});
+			return `- [[${peer}]] — ${annotation} <!-- ${RELATIONSHIP_COMMENT_PREFIX} ${metadata} -->`;
+		});
+		return [
+			RELATIONSHIPS_BLOCK_START,
+			'## Linked notes',
+			'',
+			...lines,
+			RELATIONSHIPS_BLOCK_END,
+		].join('\n');
+	}
+
+	private upsertManagedRelationshipsBlock(content: string, relationships: NodeRelationship[]) {
+		const nextBlock = this.buildManagedRelationshipsBlock(relationships);
+		const blockRegex = /\n*<!-- IKG_RELATIONSHIPS_START -->[\s\S]*?<!-- IKG_RELATIONSHIPS_END -->\n*/g;
 		const stripped = content.replace(blockRegex, '').trimEnd();
 		if (!nextBlock) {
 			return stripped;

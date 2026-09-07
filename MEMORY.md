@@ -13,7 +13,7 @@ If both exist, newer dated notes win. Copy durable facts into **this** file so c
 - Plugin name / id: `ikendoit-graph-stuff`
 - Author: Trung / `ikendoit`
 - GitHub: https://github.com/ikendoit/ikendoit-graph-stuff
-- Version at last review: **1.0.8** (2026-07-12)
+- Version at last review: **1.0.12** (2026-09-07)
 - Not in the official Obsidian community plugin store. Devices install it with **BRAT**.
 - License: MIT
 
@@ -94,8 +94,8 @@ Local vault copy Trung mentioned (runtime only):
 - **Node toolbelt is still a thin action ring.** Bubbles exist (expand/collapse, collapse others, save layout, open note, map), but the product intent is a real node toolbox, not just show/unshow. See `memory/node-toolbox.md`.
 - **Node detail side panel is not actually rendered.** `utils/canvas_panel_display.ts` `renderSelectedNodePanel()` removes `.ikg-node-panel` nodes. CSS for the panel is still in `styles.css`. Control-plane code still *talks* to `DisplayPanel` (title, subtitle, map list, markdown preview) against elements that are never built.
 - `main.ts` is a monolith (~3000 lines) with leftover bookmarks, dual config comments (split leaf vs modal), and `any` types.
-- Custom relationship **labels** (not just z-index) are TODO.
-- Link click handler is TODO.
+- Relationship **sentences** now persist in notes (`IKG_RELATIONSHIPS` block). SVG still draws an unlabeled edge.
+- Link click handler is still TODO.
 - `box_encapsulations` grouping rectangles exist in the renderer but the dataset is an empty module-level array.
 - `DisplayPanel` expand/collapse/save buttons are never constructed, so panel handlers are currently dead.
 - Search “path highlight” is visibility (show path nodes), not a dedicated highlighted trail UI.
@@ -112,6 +112,7 @@ Local vault copy Trung mentioned (runtime only):
 | `![[photo.png]]` | First embed becomes avatar |
 | `Coordinate-Graph-Render(12.3/45.6)` | Pinned graph x/y |
 | `<!-- IKG_MAP_POSITIONS_START -->` … `END` | Managed map pin block |
+| `<!-- IKG_RELATIONSHIPS_START -->` … `END` | Managed bidirectional links + annotation sentences |
 
 ## Commands registered
 
@@ -143,6 +144,12 @@ GraphState (utils/graph_state.ts)
 ```
 
 ## Session log
+
+### 2026-09-07 — Link + new neighbor toolbox verbs
+
+- Toolbelt grew two people-first verbs: **Link** (pick another node, save one sentence onto both notes) and **New note** (create a neighbor file beside the source, then same annotation).
+- Persistence matches map pins: append a managed markdown block with newlines, plus `[[wikilink]]` so the graph edge appears after refresh.
+- After create, the new node is pinned near the source so the user can drag, Save layout, add a map pin, then Loop note for images.
 
 ### 2026-08-15 — Cursor onboarding / dual-agent knowledge base
 

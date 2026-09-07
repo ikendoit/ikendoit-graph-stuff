@@ -7,6 +7,13 @@ export interface NodeMapPosition {
 	createdAt?: string;
 }
 
+export interface NodeRelationship {
+	id: string;
+	peer: string;
+	annotation: string;
+	createdAt?: string;
+}
+
 export interface GraphNode {
 	source: string;
 	nodeFilePath: string;
@@ -209,6 +216,89 @@ export class GraphState {
 		}
 		node.fx = coords.fx;
 		node.fy = coords.fy;
+	}
+
+	registerNode(node: GraphNode): GraphNode {
+		const existing = this.nodeLookup.get(node.source);
+		if (existing) {
+			existing.nodeFilePath = node.nodeFilePath || existing.nodeFilePath;
+			if (node.tags) {
+				existing.tags = node.tags;
+			}
+			if (typeof node.description === 'string') {
+				existing.description = node.description;
+			}
+			if (node.mapPositions) {
+				existing.mapPositions = node.mapPositions;
+			}
+			if (node.fx != null) {
+				existing.fx = node.fx;
+			}
+			if (node.fy != null) {
+				existing.fy = node.fy;
+			}
+			if (node.image) {
+				existing.image = node.image;
+			}
+			if (node.imageCandidates) {
+				existing.imageCandidates = node.imageCandidates;
+			}
+			this.nodeSearchLookup.set(existing.source, this.buildSearchText(existing));
+			this.recomputeVisibility();
+			return existing;
+		}
+		this.nodes.push(node);
+		this.nodeLookup.set(node.source, node);
+		this.nodeSearchLookup.set(node.source, this.buildSearchText(node));
+		if (!this.adjacencyList.has(node.source)) {
+			this.adjacencyList.set(node.source, []);
+		}
+		this.recomputeVisibility();
+		return node;
+	}
+
+	hasLink(sourceId: string, targetId: string): boolean {
+		return this.links.some((link) => (
+			(link.source === sourceId && link.target === targetId) ||
+			(link.source === targetId && link.target === sourceId)
+		));
+	}
+
+	registerLink(link: GraphLink): void {
+		if (!link.source || !link.target || link.source === link.target) {
+			return;
+		}
+		if (!this.hasLink(link.source, link.target)) {
+			this.links.push({
+				source: link.source,
+				target: link.target,
+				zIndex: link.zIndex ?? 1,
+			});
+			this.adjacencyList = this.buildAdjacencyList();
+		}
+		this.recomputeVisibility();
+	}
+
+	findNodeIdByTitle(rawTitle: string): string | null {
+		const normalized = rawTitle.trim().toLowerCase();
+		if (!normalized) {
+			return null;
+		}
+		if (this.nodeLookup.has(rawTitle.trim())) {
+			return rawTitle.trim();
+		}
+		for (const node of this.nodes) {
+			if (node.source.toLowerCase() === normalized) {
+				return node.source;
+			}
+		}
+		for (const node of this.nodes) {
+			const base = node.source.split('/').filter(Boolean).pop()?.toLowerCase();
+			if (base === normalized) {
+				return node.source;
+			}
+		}
+		return null;
 	}
 
 	updateNodeContent(nodeId: string, updates: { description?: string; mapPositions?: NodeMapPosition[] }) {
